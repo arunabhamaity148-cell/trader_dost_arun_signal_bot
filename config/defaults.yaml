@@ -1,0 +1,147 @@
+system:
+  history_size: 3000
+  min_snapshots_before_signals: 30
+watchlist:
+  binance: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "ARBUSDT"]
+  bybit: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "ARBUSDT"]
+  okx: ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "BNB-USDT-SWAP", "XRP-USDT-SWAP", "DOGE-USDT-SWAP", "ADA-USDT-SWAP", "AVAX-USDT-SWAP", "LINK-USDT-SWAP", "ARB-USDT-SWAP"]
+  hyperliquid: ["BTC-PERP", "ETH-PERP", "SOL-PERP", "BNB-PERP", "XRP-PERP", "DOGE-PERP", "ADA-PERP", "AVAX-PERP", "LINK-PERP", "ARB-PERP"]
+  deribit: ["BTC-PERPETUAL", "ETH-PERPETUAL"]
+connectors:
+  binance:
+    open_interest_poll_seconds: 15
+  okx:
+    open_interest_poll_seconds: 15
+  hyperliquid:
+    open_interest_poll_seconds: 15
+  deribit:
+    options_poll_seconds: 30
+external:
+  refresh_seconds: 180
+ops:
+  health_alert_threshold: 60
+  health_port: 8080
+risk:
+  daily_loss_limit_r: 4
+  kill_switch_after_consecutive_losses: 4
+adaptive:
+  kelly_cap: 0.03
+  kelly_fraction: 0.5
+  hmm_regimes: 3
+  hmm_min_samples: 500
+  hmm_refit_seconds: 300
+  hmm_transition_confirmation_ticks: 3
+  meta_label_threshold: 0.55
+  max_gross_exposure: 0.1
+  max_same_direction_exposure: 0.06
+  prior_strength: 10
+strategy_priors:
+  liquidation_cascade_continuation: 92
+  extreme_funding_crowding_reversion: 90
+  order_flow_imbalance_continuation: 89
+  aggressor_exhaustion_absorption_fade: 86
+  fresh_oi_breakout_continuation: 84
+  single_venue_premium_snapback: 82
+  cross_venue_basis_dispersion_convergence: 80
+  spot_index_lead_follow_through: 78
+  funding_window_inventory_rebalance: 74
+  deribit_iv_shock_repricing: 71
+strategies:
+  liquidation_cascade_continuation:
+    atr_stop_multiplier: 0.7
+    target_multiple: 3.0
+  extreme_funding_crowding_reversion:
+    atr_stop_multiplier: 0.5
+    target_multiple: 1.5
+  order_flow_imbalance_continuation:
+    atr_stop_multiplier: 1.0
+    target_multiple: 2.0
+  aggressor_exhaustion_absorption_fade:
+    cvd_extreme: 1000
+    atr_stop_multiplier: 1.0
+  fresh_oi_breakout_continuation:
+    delta_oi_min: 10000
+    premium_z_max: 2.0
+    atr_stop_multiplier: 1.0
+  single_venue_premium_snapback:
+    delta_oi_abs_max: 10000
+    atr_stop_multiplier: 0.75
+  cross_venue_basis_dispersion_convergence:
+    premium_gap_min: 5
+    atr_stop_multiplier: 1.0
+  spot_index_lead_follow_through:
+    lag_gap_min: 4
+    atr_stop_multiplier: 1.0
+  funding_window_inventory_rebalance:
+    funding_abs_min: 0.0001
+    open_interest_min: 1
+    atr_stop_multiplier: 1.0
+  deribit_iv_shock_repricing:
+    iv_proxy_min: 1.8
+    skew_abs_min: 0.05
+    atr_stop_multiplier: 1.0
+vetoes:
+  volatility_anomaly:
+    rv_5m_max: 0.15
+  exchange_instability:
+    max_mark_index_gap_bps: 40
+    max_feed_lag_seconds: 2
+  correlation_spike:
+    dispersion_limit: 150
+  cross_venue_dispersion:
+    price_dispersion_limit: 250
+    premium_dispersion_limit: 50
+  funding_proximity:
+    pre_minutes: 5
+    post_minutes: 3
+  liquidation_tape:
+    liquidation_notional_limit: 1000000
+execution:
+  slippage_mode: realistic
+telegram:
+  admin_chat_id: ""
+  counter_db: ./data/signal_counter.sqlite3
+ml:
+  min_rows_for_walk_forward: 1000
+  calibration_min_samples: 200
+  retrain_max_rows: 5000
+backtest:
+  default_lookback_days: 90
+positions:
+  db_path: ./data/positions.sqlite3
+checkpoint:
+  path: ./data/checkpoint.json
+news_guard:
+  refresh_seconds: 120
+  replay_db_path: ./data/news_guard_replay.sqlite3
+  semantic_similarity_threshold: 0.72
+  rss_sources:
+    - name: sec_press
+      url: https://www.sec.gov/news/pressreleases.rss
+      source_type: regulator
+    - name: coindesk
+      url: https://www.coindesk.com/arc/outboundfeeds/rss/
+      source_type: crypto_news
+    - name: cointelegraph
+      url: https://cointelegraph.com/rss
+      source_type: crypto_news
+    - name: bloomberg_crypto
+      url: https://feeds.bloomberg.com/crypto/news.rss
+      source_type: macro
+    - name: the_block
+      url: https://www.theblock.co/rss.xml
+      source_type: crypto_news
+  x_sources:
+    - name: binance_status_x
+      rss_url: https://nitter.net/binance/rss
+    - name: okx_x
+      rss_url: https://nitter.net/okx/rss
+  telegram_sources:
+    - name: binance_announcements
+      channel: BinanceAnnouncements
+    - name: hyperliquid_announcements
+      channel: hyperliquidx
+  whale_monitor:
+    name: multi_chain_whales
+    min_usd_notional: 1000000
+    watched_addresses: []
