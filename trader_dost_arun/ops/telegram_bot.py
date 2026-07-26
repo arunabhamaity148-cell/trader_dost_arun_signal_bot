@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from trader_dost_arun.core.persistence import PositionStore
+
+LOGGER = logging.getLogger(__name__)
 
 
 class TelegramAdminBot:
@@ -19,6 +22,7 @@ class TelegramAdminBot:
         self.position_store = position_store or PositionStore()
         self.state = self._load_state()
         self._task: asyncio.Task | None = None
+        self._stop = asyncio.Event()
 
     def _load_state(self) -> dict[str, Any]:
         if not self.state_path.exists():
@@ -60,25 +64,45 @@ class TelegramAdminBot:
         return "Unknown command"
 
     async def start(self) -> None:
-        if self._task is None and self.token and self.admin_chat_id:
-            self._task = asyncio.create_task(self._poll_loop())
+        if not self.token:
+            LOGGER.info("Telegram DISABLED - missing bot token")
+            return
+        if not self.admin_chat_id:
+            LOGGER.info("Telegram DISABLED - missing admin chat id")
+            return
+        if self._task is None:
+            LOGGER.info("Telegram ENABLED - admin bot polling active")
+            self._stop.clear()
+            self._task = asyncio.create_task(self._poll_loop(), name="telegram-admin-poll")
 
     async def stop(self) -> None:
+        self._stop.set()
         if self._task is not None:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
+            self._task = None
 
     async def _poll_loop(self) -> None:
         offset = 0
         async with httpx.AsyncClient(timeout=15) as client:
-            while True:
-                response = await client.get(f"https://api.telegram.org/bot{self.token}/getUpdates", params={"offset": offset, "timeout": 10})
-                payload = response.json()
-                for item in payload.get("result", []):
-                    offset = item.get("update_id", offset) + 1
-                    message = item.get("message", {})
-                    chat_id = str(message.get("chat", {}).get("id", ""))
-                    if chat_id != self.admin_chat_id:
+            while not self._stop.is_set():
+                try:
+                    response = await client.get(f"https://api.telegram.org/bot{self.token}/getUpdates", params={"offset": offset, "timeout": 10})
+                    response.raise_for_status()
+                    payload = response.json()
+                    for item in payload.get("result", []):
+                        offset = item.get("update_id", offset) + 1
+                        message = item.get("message", {})
+                        chat_id = str(message.get("chat", {}).get("id", ""))
+                        if chat_id != self.admin_chat_id:
+                            continue
+                        reply = self.handle_command(message.get("text", ""))
+                        await client.post(f"https://api.telegram.org/bot{self.token}/sendMessage", json={"chat_id": self.admin_chat_id, "text": reply})
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("telegram admin poll failed: %s", exc)
+                    try:
+                        await asyncio.wait_for(self._stop.wait(), timeout=5)
+                    except asyncio.TimeoutError:
                         continue
-                    reply = self.handle_command(message.get("text", ""))
-                    await client.post(f"https://api.telegram.org/bot{self.token}/sendMessage", json={"chat_id": self.admin_chat_id, "text": reply})

@@ -4,11 +4,15 @@ import abc
 import asyncio
 import json
 import logging
+import random
+import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 import websockets
+from websockets import ConnectionClosed
 
 from trader_dost_arun.core.models import Direction, LiquidationEvent, MarketSnapshot, OrderBookLevel, Trade
 from trader_dost_arun.ops.latency import LatencyMonitor
@@ -22,6 +26,25 @@ def parse_ts(value: int | float | None) -> datetime:
     if value > 1_000_000_000_000:
         value = value / 1000
     return datetime.fromtimestamp(value, tz=timezone.utc)
+
+
+def compute_backoff_delay(
+    attempt: int,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+    jitter_ratio: float = 0.2,
+    rng: random.Random | None = None,
+) -> float:
+    generator = rng or random
+    capped = min(max_delay, base_delay * (2 ** max(attempt - 1, 0)))
+    jitter_span = capped * max(jitter_ratio, 0.0)
+    if jitter_span == 0:
+        return capped
+    return max(0.0, min(max_delay, capped + generator.uniform(-jitter_span, jitter_span)))
+
+
+def should_reset_retry_state(uptime_seconds: float, had_messages: bool, stable_window_seconds: float) -> bool:
+    return had_messages and uptime_seconds >= stable_window_seconds
 
 
 class BasePublicConnector(abc.ABC):
@@ -44,12 +67,23 @@ class BasePublicConnector(abc.ABC):
         self._cached_premium: float | None = None
         self._cached_option_atm_iv: float | None = None
         self._cached_option_put_call_skew: float | None = None
+        self._ws = None
+        self._closed = False
 
     async def stop(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self._stop.set()
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:  # noqa: BLE001
+                pass
         for task in self._bg_tasks:
             task.cancel()
         await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+        self._bg_tasks.clear()
         await self._rest_client.aclose()
 
     @abc.abstractmethod
@@ -95,47 +129,87 @@ class BasePublicConnector(abc.ABC):
 
     async def emit_snapshot(self, queue: asyncio.Queue, **kwargs: Any) -> None:
         snapshot = self.build_snapshot(datetime.now(timezone.utc), [], [], **kwargs)
-        self.latency_monitor.record(self.venue, snapshot.event_time)
+        self.latency_monitor.record(self.venue, snapshot.event_time, symbol=self.symbol)
         await queue.put(snapshot)
+
+    async def _sleep_or_stop(self, delay: float) -> None:
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            return
 
     async def stream(self, queue: asyncio.Queue) -> None:
         if not self._bg_tasks:
             self._bg_tasks = self.supplemental_streams(queue)
-        backoff = 1.0
+        attempt = 0
+        stable_window = float(self.config.get("stable_connection_reset_seconds", 20.0))
+        base_backoff = float(self.config.get("reconnect_base_delay_seconds", 1.0))
+        max_backoff = float(self.config.get("reconnect_max_delay_seconds", 30.0))
+        jitter_ratio = float(self.config.get("reconnect_jitter_ratio", 0.2))
+        recv_timeout = float(self.config.get("recv_timeout_seconds", 30.0))
         try:
             while not self._stop.is_set():
+                connection_id = uuid.uuid4().hex[:12]
+                connected_at = time.monotonic()
+                last_message_at: float | None = None
+                reason = "disconnect"
                 try:
                     async with websockets.connect(self.ws_url, ping_interval=15, ping_timeout=15, max_size=2**24) as websocket:
+                        self._ws = websocket
+                        self.latency_monitor.connection_open(self.venue, self.symbol, connection_id)
                         for message in self.subscription_messages():
                             await websocket.send(json.dumps(message))
-                        self.logger.info("connected")
-                        backoff = 1.0
+                        self.logger.info("connected venue=%s symbol=%s connection_id=%s", self.venue, self.symbol, connection_id)
                         while not self._stop.is_set():
-                            raw = await asyncio.wait_for(websocket.recv(), timeout=30)
+                            raw = await asyncio.wait_for(websocket.recv(), timeout=recv_timeout)
+                            last_message_at = time.monotonic()
+                            self.latency_monitor.record_message(self.venue, self.symbol)
                             payload = json.loads(raw)
                             parsed = self.parse_message(payload)
                             for item in parsed:
                                 if isinstance(item, MarketSnapshot):
                                     self._update_cache_from_snapshot(item)
-                                self.latency_monitor.record(self.venue, getattr(item, "event_time", datetime.now(timezone.utc)))
+                                self.latency_monitor.record(self.venue, getattr(item, "event_time", datetime.now(timezone.utc)), symbol=self.symbol)
                                 await queue.put(item)
-                except asyncio.TimeoutError:
-                    self.latency_monitor.reconnect(self.venue)
-                    self.logger.warning("timeout, reconnecting")
+                    reason = "socket_closed"
                 except asyncio.CancelledError:
                     raise
+                except asyncio.TimeoutError:
+                    reason = "recv_timeout"
+                except ConnectionClosed as exc:
+                    reason = f"connection_closed:{exc.code}"
                 except Exception as exc:  # noqa: BLE001
-                    self.latency_monitor.error(self.venue)
-                    self.latency_monitor.reconnect(self.venue)
-                    self.logger.warning("connector error: %s", exc)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30)
+                    reason = type(exc).__name__
+                    self.latency_monitor.error(self.venue, self.symbol)
+                    self.logger.warning("connector error venue=%s symbol=%s connection_id=%s error=%s", self.venue, self.symbol, connection_id, exc)
+                finally:
+                    self._ws = None
+                if self._stop.is_set():
+                    break
+                uptime = max(time.monotonic() - connected_at, 0.0)
+                had_messages = last_message_at is not None
+                last_message_age = None if last_message_at is None else max(time.monotonic() - last_message_at, 0.0)
+                if should_reset_retry_state(uptime, had_messages, stable_window):
+                    attempt = 1
+                    self.latency_monitor.stable_connection(self.venue, self.symbol)
+                else:
+                    attempt += 1
+                backoff = compute_backoff_delay(attempt, base_delay=base_backoff, max_delay=max_backoff, jitter_ratio=jitter_ratio)
+                self.latency_monitor.reconnect(self.venue, self.symbol, connection_id, reason, uptime, last_message_age, attempt, backoff)
+                self.logger.warning(
+                    "reconnect venue=%s symbol=%s connection_id=%s reason=%s uptime=%.2fs last_message_age=%s attempt=%s backoff=%.2fs",
+                    self.venue,
+                    self.symbol,
+                    connection_id,
+                    reason,
+                    uptime,
+                    f"{last_message_age:.2f}s" if last_message_age is not None else "none",
+                    attempt,
+                    backoff,
+                )
+                await self._sleep_or_stop(backoff)
         finally:
-            for task in self._bg_tasks:
-                task.cancel()
-            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
-            self._bg_tasks.clear()
-            await self._rest_client.aclose()
+            await self.stop()
 
     def _coerce_level(self, level: Any) -> tuple[float, float]:
         if isinstance(level, dict):

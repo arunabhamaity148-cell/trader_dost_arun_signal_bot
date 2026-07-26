@@ -65,6 +65,7 @@ class MarketSnapshot:
     spread: float | None = None
     option_atm_iv: float | None = None
     option_put_call_skew: float | None = None
+    arrival_time: datetime = field(default_factory=utc_now)
 
     @property
     def mid_price(self) -> float | None:
@@ -173,6 +174,8 @@ class VenueHealth:
     stale_seconds: float
     veto_failure_rate: float
     error_rate: float
+    status: str = "healthy"
+    sample_count: int = 0
 
 
 @dataclass(slots=True)

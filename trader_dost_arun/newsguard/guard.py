@@ -15,6 +15,7 @@ except Exception:  # noqa: BLE001
 
 from trader_dost_arun.core.models import FeatureSet
 from trader_dost_arun.core.state import MarketStateStore
+from trader_dost_arun.core.symbols import normalize_instrument
 from trader_dost_arun.data.external import ExternalContext
 from trader_dost_arun.newsguard.calendar import EconomicCalendarClient
 from trader_dost_arun.newsguard.db import EventReplayStore
@@ -212,7 +213,8 @@ class NewsGuard:
         return 0.5 ** (age_minutes / half_life)
 
     def _symbol_matches(self, event: NewsEvent, symbol: str) -> bool:
-        base_symbol = symbol.replace("USDT", "").replace("-USDT-SWAP", "").replace("-PERP", "").replace("-PERPETUAL", "")
+        identity = normalize_instrument("", symbol)
+        base_symbol = identity.base_asset
         if base_symbol in event.symbols or symbol in event.symbols:
             return True
         for anchor, related in self.PROPAGATION.items():

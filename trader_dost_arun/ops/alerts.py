@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 
 from trader_dost_arun.core.models import Direction, Signal, VenueHealth
+from trader_dost_arun.ops.logging_utils import CooldownDeduper
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,16 +33,23 @@ class TelegramAlerter:
         self.token = token
         self.chat_id = chat_id
         self.counter = SignalCounterStore(counter_db)
+        self._health_deduper = CooldownDeduper(default_cooldown_seconds=60.0)
+        self._disabled_log_deduper = CooldownDeduper(default_cooldown_seconds=300.0)
 
     async def send(self, text: str, parse_mode: str = "HTML") -> None:
         if not self.token or not self.chat_id:
-            LOGGER.info("telegram disabled: %s", text)
+            if self._disabled_log_deduper.should_emit("telegram-disabled"):
+                LOGGER.info("Telegram DISABLED - missing token or chat id")
             return
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": self.chat_id, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True},
-            )
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(
+                    f"https://api.telegram.org/bot{self.token}/sendMessage",
+                    json={"chat_id": self.chat_id, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True},
+                )
+                response.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("telegram send failed: %s", exc)
 
     def _bar(self, value: float) -> str:
         filled = max(0, min(10, round(value / 10)))
@@ -150,4 +158,9 @@ class TelegramAlerter:
         await self.send(self.render_signal(signal), parse_mode="HTML")
 
     async def health_alert(self, health: VenueHealth) -> None:
-        await self.send(f"⚠️ <b>Health warning</b> {health.venue}: score={health.score:.1f}, p95={health.p95_latency_ms:.1f}ms, stale={health.stale_seconds:.1f}s, reconnects={health.reconnect_count}")
+        key = f"health:{health.venue}:{health.status}:{round(health.score, 0)}"
+        if not self._health_deduper.should_emit(key):
+            return
+        await self.send(
+            f"⚠️ <b>Health warning</b> {health.venue}: status={health.status}, score={health.score:.1f}, p95={health.p95_latency_ms:.1f}ms, stale={health.stale_seconds:.1f}s, reconnects={health.reconnect_count}"
+        )

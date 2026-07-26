@@ -14,6 +14,7 @@ class VetoEngine:
 
     def evaluate(self, strategy_name: str, venue: str, symbol: str, features: FeatureSet, structural: StructuralState, state: MarketStateStore, external: ExternalContext, peer_features: dict[str, FeatureSet], minutes_to_funding: float | None = None, news_assessment: ImpactAssessment | None = None) -> tuple[dict[str, bool], str | None]:
         checks = {
+            "stale_snapshot": self._stale_snapshot(venue, symbol, features, state),
             "spread_depth_deterioration": self._spread_depth_veto(venue, symbol, features, state),
             "wrong_leverage_regime": self._wrong_leverage_regime(strategy_name, features),
             "volatility_anomaly": self._volatility_anomaly(strategy_name, features),
@@ -28,6 +29,17 @@ class VetoEngine:
         }
         failed = [name for name, allowed in checks.items() if not allowed]
         return checks, failed[0] if failed else None
+
+    def _stale_snapshot(self, venue: str, symbol: str, features: FeatureSet, state: MarketStateStore) -> bool:
+        max_age_seconds = float(self.config["vetoes"]["exchange_instability"].get("max_feed_lag_seconds", 2))
+        age_ok = (datetime.now(timezone.utc) - features.timestamp).total_seconds() <= max_age_seconds
+        local_view = state.view(venue, symbol)
+        if not local_view.snapshots:
+            return age_ok
+        min_sources = int(self.config["vetoes"].get("freshness_quorum", {}).get("min_sources", 2))
+        freshness = state.freshness(venue, symbol, max_age_seconds=max_age_seconds, min_sources=min_sources)
+        own_age = freshness.own_age_seconds if freshness.own_age_seconds is not None else float("inf")
+        return age_ok and own_age <= max_age_seconds and freshness.quorum_met
 
     def _spread_depth_veto(self, venue: str, symbol: str, features: FeatureSet, state: MarketStateStore) -> bool:
         spread = features.get("spread")

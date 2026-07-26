@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -115,7 +115,7 @@ class PositionStore:
                 SET closed_at = ?, exit_price = ?, realized_r = ?, exit_reason = ?
                 WHERE symbol = ? AND venue = ? AND closed_at IS NULL
                 """,
-                (datetime.utcnow().isoformat(), exit_price, realized_r, exit_reason, symbol, venue),
+                (datetime.now(timezone.utc).isoformat(), exit_price, realized_r, exit_reason, symbol, venue),
             )
 
     def get_history(self, limit: int = 100) -> list[dict[str, Any]]:
