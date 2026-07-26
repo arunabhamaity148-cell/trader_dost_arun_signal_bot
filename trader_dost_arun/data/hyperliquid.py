@@ -69,8 +69,8 @@ class HyperliquidConnector(BasePublicConnector):
         data = payload.get("data", {})
         if channel == "l2Book" and data:
             levels = data.get("levels", [[], []])
-            bids = [[level[0], level[1]] for level in levels[0]]
-            asks = [[level[0], level[1]] for level in levels[1]]
+            bids = levels[0] if len(levels) > 0 else []
+            asks = levels[1] if len(levels) > 1 else []
             return [self.build_snapshot(parse_ts(data.get("time")), bids, asks)]
         if channel == "trades":
             return [self.build_trade(item.get("px", 0.0), item.get("sz", 0.0), item.get("side", "buy"), parse_ts(item.get("time"))) for item in data]

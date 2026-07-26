@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -13,6 +14,8 @@ import httpx
 from bs4 import BeautifulSoup
 
 from trader_dost_arun.newsguard.models import NewsEvent
+
+LOGGER = logging.getLogger(__name__)
 
 SYMBOL_HINTS = {
     "BTC": ["BTC", "BITCOIN"],
@@ -95,9 +98,13 @@ class RSSNewsSource(BaseNewsSource):
         self.source_type = source_type
 
     async def fetch(self) -> list[RawNewsItem]:
-        response = await self.client.get(self.url)
-        response.raise_for_status()
-        root = ElementTree.fromstring(response.text)
+        try:
+            response = await self.client.get(self.url, follow_redirects=True)
+            response.raise_for_status()
+            root = ElementTree.fromstring(response.text)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("rss source %s failed: %s", self.name, exc)
+            return []
         items = root.findall(".//item")[:20]
         results: list[RawNewsItem] = []
         for item in items:
@@ -116,9 +123,13 @@ class TelegramChannelSource(BaseNewsSource):
         self.channel = channel.lstrip("@")
 
     async def fetch(self) -> list[RawNewsItem]:
-        response = await self.client.get(f"https://t.me/s/{self.channel}")
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
+        try:
+            response = await self.client.get(f"https://t.me/s/{self.channel}", follow_redirects=True)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("telegram source %s failed: %s", self.name, exc)
+            return []
         messages = soup.select("div.tgme_widget_message")[:10]
         results: list[RawNewsItem] = []
         for node in messages:
@@ -147,20 +158,25 @@ class EtherscanWhaleSource(BaseNewsSource):
         for watched in self.watched_addresses:
             address = watched.get("address", "")
             symbol = watched.get("symbol", "ETH")
-            response = await self.client.get(
-                "https://api.etherscan.io/api",
-                params={
-                    "module": "account",
-                    "action": "txlist",
-                    "address": address,
-                    "sort": "desc",
-                    "page": 1,
-                    "offset": 10,
-                    "apikey": self.api_key,
-                },
-            )
-            response.raise_for_status()
-            rows = response.json().get("result", [])
+            try:
+                response = await self.client.get(
+                    "https://api.etherscan.io/api",
+                    params={
+                        "module": "account",
+                        "action": "txlist",
+                        "address": address,
+                        "sort": "desc",
+                        "page": 1,
+                        "offset": 10,
+                        "apikey": self.api_key,
+                    },
+                    follow_redirects=True,
+                )
+                response.raise_for_status()
+                rows = response.json().get("result", [])
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("etherscan whale source %s address %s failed: %s", self.name, address, exc)
+                continue
             for row in rows:
                 value_eth = float(row.get("value", 0.0)) / 1e18
                 if value_eth * float(watched.get("reference_price", 0.0) or 0.0) < self.min_usd_notional:

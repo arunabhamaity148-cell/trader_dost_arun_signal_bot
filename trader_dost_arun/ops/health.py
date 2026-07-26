@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import asdict
 
 from trader_dost_arun.core.models import VenueHealth
 
 try:
-    from prometheus_client import Counter, Histogram, generate_latest
+    from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 except Exception:  # noqa: BLE001
+    CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
     Counter = Histogram = None
     generate_latest = None
 
@@ -54,14 +54,24 @@ class OpsHttpServer:
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         request_line = (await reader.readline()).decode("utf-8", "ignore")
         path = request_line.split(" ")[1] if " " in request_line else "/health"
+        status_line = "HTTP/1.1 200 OK"
         if path.startswith("/metrics") and generate_latest is not None:
-            body = generate_latest().decode("utf-8")
-            content_type = "text/plain"
-        else:
-            body = json.dumps(self.status)
+            body_bytes = generate_latest()
+            content_type = CONTENT_TYPE_LATEST
+        elif path.startswith("/health") or path == "/":
+            body_bytes = json.dumps(self.status).encode("utf-8")
             content_type = "application/json"
-        response = f"HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {len(body.encode())}\r\nConnection: close\r\n\r\n{body}"
-        writer.write(response.encode("utf-8"))
+        else:
+            status_line = "HTTP/1.1 404 Not Found"
+            body_bytes = b'{"status":"not_found"}'
+            content_type = "application/json"
+        response_headers = (
+            f"{status_line}\r\n"
+            f"Content-Type: {content_type}\r\n"
+            f"Content-Length: {len(body_bytes)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("utf-8")
+        writer.write(response_headers + body_bytes)
         await writer.drain()
         writer.close()
         await writer.wait_closed()

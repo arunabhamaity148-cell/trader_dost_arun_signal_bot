@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from statistics import mean
 
 from trader_dost_arun.core.models import Direction, MarketStateView, StructuralState
@@ -94,20 +94,33 @@ def detect_fvg(highs: list[float], lows: list[float]) -> tuple[bool, bool]:
     return bullish, bearish
 
 
+def _last_matching_candle(opens: list[float], closes: list[float], start: int, end: int, *, bearish: bool) -> int | None:
+    indices = range(end - 1, start - 1, -1)
+    for idx in indices:
+        if bearish and closes[idx] < opens[idx]:
+            return idx
+        if not bearish and closes[idx] > opens[idx]:
+            return idx
+    return None
+
+
 def detect_order_blocks(opens: list[float], closes: list[float], highs: list[float], lows: list[float]) -> tuple[OrderBlock | None, OrderBlock | None]:
     if len(closes) < 4:
         return None, None
     bullish: OrderBlock | None = None
     bearish: OrderBlock | None = None
     for idx in range(1, len(closes)):
-        prev_bearish = closes[idx - 1] < opens[idx - 1]
-        prev_bullish = closes[idx - 1] > opens[idx - 1]
-        if closes[idx] > max(highs[max(0, idx - 3) : idx]):
-            if prev_bearish:
-                bullish = OrderBlock("bullish", lows[idx - 1], highs[idx - 1], mitigated=closes[-1] < lows[idx - 1])
-        if closes[idx] < min(lows[max(0, idx - 3) : idx]):
-            if prev_bullish:
-                bearish = OrderBlock("bearish", lows[idx - 1], highs[idx - 1], mitigated=closes[-1] > highs[idx - 1])
+        window_start = max(0, idx - 3)
+        prior_highs = highs[window_start:idx]
+        prior_lows = lows[window_start:idx]
+        if prior_highs and closes[idx] > max(prior_highs):
+            source_idx = _last_matching_candle(opens, closes, window_start, idx, bearish=True)
+            if source_idx is not None:
+                bullish = OrderBlock("bullish", lows[source_idx], highs[source_idx], mitigated=closes[-1] < lows[source_idx])
+        if prior_lows and closes[idx] < min(prior_lows):
+            source_idx = _last_matching_candle(opens, closes, window_start, idx, bearish=False)
+            if source_idx is not None:
+                bearish = OrderBlock("bearish", lows[source_idx], highs[source_idx], mitigated=closes[-1] > highs[source_idx])
     return bullish, bearish
 
 
@@ -160,8 +173,8 @@ def build_structural_state(view: MarketStateView, delta_oi: float, timeframes: d
         "premium_discount": premium_discount_zone(view.closes[-100:] if view.closes else []),
         "inducement_level": max(view.highs[-5:], default=0.0) if final_trend == Direction.LONG else min(view.lows[-5:], default=0.0),
         "breaker_block": bool((bullish_ob and bullish_ob.mitigated) or (bearish_ob and bearish_ob.mitigated)),
-        "bullish_order_block": bullish_ob.__dict__ if bullish_ob else None,
-        "bearish_order_block": bearish_ob.__dict__ if bearish_ob else None,
+        "bullish_order_block": asdict(bullish_ob) if bullish_ob else None,
+        "bearish_order_block": asdict(bearish_ob) if bearish_ob else None,
     }
     return StructuralState(
         bos=bos,

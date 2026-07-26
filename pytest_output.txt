@@ -1,0 +1,10 @@
+................................................                         [100%]
+=============================== warnings summary ===============================
+tests/test_persistence.py::test_close_position_updates_history
+tests/test_signal_engine_outcomes.py::test_position_monitor_updates_learning_components
+  /home/user/downloads/trader_fix/trader_dost_arun_signal_bot-main/trader_dost_arun/core/persistence.py:118: DeprecationWarning:
+  
+  datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+48 passed, 2 warnings in 2.18s

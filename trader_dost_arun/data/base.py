@@ -127,7 +127,7 @@ class BasePublicConnector(abc.ABC):
                 except Exception as exc:  # noqa: BLE001
                     self.latency_monitor.error(self.venue)
                     self.latency_monitor.reconnect(self.venue)
-                    self.logger.exception("connector error: %s", exc)
+                    self.logger.warning("connector error: %s", exc)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
         finally:
@@ -137,11 +137,30 @@ class BasePublicConnector(abc.ABC):
             self._bg_tasks.clear()
             await self._rest_client.aclose()
 
+    def _coerce_level(self, level: Any) -> tuple[float, float]:
+        if isinstance(level, dict):
+            price = level.get("price", level.get("px", level.get("p", 0.0)))
+            size = level.get("size", level.get("sz", level.get("q", 0.0)))
+            return float(price or 0.0), float(size or 0.0)
+        if isinstance(level, (list, tuple)):
+            numeric_values: list[float] = []
+            for item in level:
+                try:
+                    numeric_values.append(float(item))
+                except (TypeError, ValueError):
+                    continue
+                if len(numeric_values) == 2:
+                    break
+            if len(numeric_values) >= 2:
+                return numeric_values[0], numeric_values[1]
+            return 0.0, 0.0
+        return 0.0, 0.0
+
     def build_snapshot(
         self,
         event_time: datetime,
-        bids: list[list[float]],
-        asks: list[list[float]],
+        bids: list[Any],
+        asks: list[Any],
         mark_price: float | None = None,
         index_price: float | None = None,
         funding_rate: float | None = None,
@@ -150,8 +169,8 @@ class BasePublicConnector(abc.ABC):
         option_atm_iv: float | None = None,
         option_put_call_skew: float | None = None,
     ) -> MarketSnapshot:
-        bid_levels = [OrderBookLevel(price=float(price), size=float(size)) for price, size in bids[:10]]
-        ask_levels = [OrderBookLevel(price=float(price), size=float(size)) for price, size in asks[:10]]
+        bid_levels = [OrderBookLevel(price=price, size=size) for price, size in (self._coerce_level(level) for level in bids[:10]) if price or size]
+        ask_levels = [OrderBookLevel(price=price, size=size) for price, size in (self._coerce_level(level) for level in asks[:10]) if price or size]
         spread = ask_levels[0].price - bid_levels[0].price if bid_levels and ask_levels else 0.0
         merged_mark = self._merge_cache(mark_price, "_cached_mark_price")
         merged_index = self._merge_cache(index_price, "_cached_index_price")

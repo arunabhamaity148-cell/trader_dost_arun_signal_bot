@@ -1,0 +1,66 @@
+# HELP python_gc_objects_collected_total Objects collected during gc
+# TYPE python_gc_objects_collected_total counter
+python_gc_objects_collected_total{generation="0"} 812.0
+python_gc_objects_collected_total{generation="1"} 52.0
+python_gc_objects_collected_total{generation="2"} 0.0
+# HELP python_gc_objects_uncollectable_total Uncollectable objects found during GC
+# TYPE python_gc_objects_uncollectable_total counter
+python_gc_objects_uncollectable_total{generation="0"} 0.0
+python_gc_objects_uncollectable_total{generation="1"} 0.0
+python_gc_objects_uncollectable_total{generation="2"} 0.0
+# HELP python_gc_collections_total Number of times this generation was collected
+# TYPE python_gc_collections_total counter
+python_gc_collections_total{generation="0"} 134.0
+python_gc_collections_total{generation="1"} 12.0
+python_gc_collections_total{generation="2"} 1.0
+# HELP python_info Python platform information
+# TYPE python_info gauge
+python_info{implementation="CPython",major="3",minor="13",patchlevel="14",version="3.13.14"} 1.0
+# HELP process_virtual_memory_bytes Virtual memory size in bytes.
+# TYPE process_virtual_memory_bytes gauge
+process_virtual_memory_bytes 9.9065856e+08
+# HELP process_resident_memory_bytes Resident memory size in bytes.
+# TYPE process_resident_memory_bytes gauge
+process_resident_memory_bytes 2.67436032e+08
+# HELP process_start_time_seconds Start time of the process since unix epoch in seconds.
+# TYPE process_start_time_seconds gauge
+process_start_time_seconds 1.78489601815e+09
+# HELP process_cpu_seconds_total Total user and system CPU time spent in seconds.
+# TYPE process_cpu_seconds_total counter
+process_cpu_seconds_total 2.21
+# HELP process_open_fds Number of open file descriptors.
+# TYPE process_open_fds gauge
+process_open_fds 86.0
+# HELP process_max_fds Maximum number of open file descriptors.
+# TYPE process_max_fds gauge
+process_max_fds 1024.0
+# HELP signals_total Signals emitted
+# TYPE signals_total counter
+signals_total 0.0
+# HELP signals_created Signals emitted
+# TYPE signals_created gauge
+signals_created 1.7848960197808013e+09
+# HELP signal_veto_total Signals vetoed
+# TYPE signal_veto_total counter
+# HELP signal_latency_seconds Signal evaluation latency
+# TYPE signal_latency_seconds histogram
+signal_latency_seconds_bucket{le="0.005"} 0.0
+signal_latency_seconds_bucket{le="0.01"} 0.0
+signal_latency_seconds_bucket{le="0.025"} 0.0
+signal_latency_seconds_bucket{le="0.05"} 0.0
+signal_latency_seconds_bucket{le="0.075"} 0.0
+signal_latency_seconds_bucket{le="0.1"} 0.0
+signal_latency_seconds_bucket{le="0.25"} 0.0
+signal_latency_seconds_bucket{le="0.5"} 0.0
+signal_latency_seconds_bucket{le="0.75"} 0.0
+signal_latency_seconds_bucket{le="1.0"} 0.0
+signal_latency_seconds_bucket{le="2.5"} 0.0
+signal_latency_seconds_bucket{le="5.0"} 0.0
+signal_latency_seconds_bucket{le="7.5"} 0.0
+signal_latency_seconds_bucket{le="10.0"} 0.0
+signal_latency_seconds_bucket{le="+Inf"} 0.0
+signal_latency_seconds_count 0.0
+signal_latency_seconds_sum 0.0
+# HELP signal_latency_seconds_created Signal evaluation latency
+# TYPE signal_latency_seconds_created gauge
+signal_latency_seconds_created 1.784896019780844e+09
