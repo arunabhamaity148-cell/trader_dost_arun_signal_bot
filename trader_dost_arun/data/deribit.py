@@ -22,6 +22,7 @@ class DeribitConnector(BasePublicConnector):
     async def _poll_option_metrics(self, queue: asyncio.Queue) -> None:
         interval = int(self.config.get("options_poll_seconds", 30))
         currency = self.symbol.split("-")[0]
+        await self.stagger_start("option-metrics-poll", max_delay_seconds=min(float(interval), 5.0))
         while not self._stop.is_set():
             try:
                 payload = await self.rest_json("/public/get_book_summary_by_currency", params={"currency": currency, "kind": "option"})

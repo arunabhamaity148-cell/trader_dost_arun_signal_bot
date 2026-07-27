@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import monotonic, perf_counter
@@ -27,6 +27,19 @@ from trader_dost_arun.signals.engine import SignalEngine
 LOGGER = logging.getLogger(__name__)
 
 
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (len(ordered) - 1) * percentile
+    low = int(rank)
+    high = min(low + 1, len(ordered) - 1)
+    weight = rank - low
+    return ordered[low] * (1 - weight) + ordered[high] * weight
+
+
 @dataclass(slots=True)
 class RuntimeStats:
     started_at_monotonic: float = field(default_factory=monotonic)
@@ -40,6 +53,9 @@ class RuntimeStats:
     reconnect_reason_distribution: Counter[str] = field(default_factory=Counter)
     unexpected_exceptions: list[str] = field(default_factory=list)
     peak_task_count: int = 0
+    queue_high_water_mark: int = 0
+    evaluation_latency_ms: deque[float] = field(default_factory=lambda: deque(maxlen=5000))
+    event_loop_lag_ms: deque[float] = field(default_factory=lambda: deque(maxlen=5000))
 
 
 class SignalEvaluationScheduler:
@@ -171,6 +187,7 @@ class TradingApplication:
         self._background_tasks = [
             asyncio.create_task(self._consume_market_data(), name="market-data-consumer"),
             asyncio.create_task(self._health_loop(), name="health-loop"),
+            asyncio.create_task(self._event_loop_monitor(), name="event-loop-monitor"),
         ]
 
     def _log_telegram_status(self) -> None:
@@ -211,6 +228,7 @@ class TradingApplication:
         assert self.queue is not None
         while not self._stop.is_set():
             item = await self.queue.get()
+            self.stats.queue_high_water_mark = max(self.stats.queue_high_water_mark, self.queue.qsize())
             try:
                 if isinstance(item, MarketSnapshot):
                     self.state.add_snapshot(item)
@@ -291,13 +309,28 @@ class TradingApplication:
                     VETO_COUNTER.labels(reason=reason).inc(count)
                 if self._suppression_log_deduper.should_emit(f"{venue}:{symbol}:{reason}"):
                     LOGGER.info("signal suppressed %s %s %s", symbol, venue, reason)
+            elapsed_seconds = perf_counter() - started
+            self.stats.evaluation_latency_ms.append(elapsed_seconds * 1000)
             if LATENCY_HIST is not None:
-                LATENCY_HIST.observe(perf_counter() - started)
+                LATENCY_HIST.observe(elapsed_seconds)
 
     def _build_feature_inputs(self, view: Any, peers: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
         feature_map = compute_features(view, peers)
         peer_features = {peer_venue: compute_features(peer_view, peers) for peer_venue, peer_view in peers.items() if peer_view.snapshots}
         return feature_map, peer_features
+
+    async def _event_loop_monitor(self) -> None:
+        interval_seconds = float(self.settings.config.get("ops", {}).get("event_loop_lag_sample_seconds", 0.5))
+        target = monotonic() + interval_seconds
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval_seconds)
+                break
+            except asyncio.TimeoutError:
+                now = monotonic()
+                lag_ms = max((now - target) * 1000, 0.0)
+                self.stats.event_loop_lag_ms.append(lag_ms)
+                target = now + interval_seconds
 
     async def _health_loop(self) -> None:
         refresh_seconds = float(self.settings.config.get("ops", {}).get("health_refresh_seconds", 1.0))
@@ -326,12 +359,18 @@ class TradingApplication:
                     elif venue_health.status in {"starting", "warmup"} and overall_status != "degraded":
                         overall_status = "starting"
                 phase = overall_status if venue_payload else "starting"
+                current_queue_depth = self.queue.qsize() if self.queue is not None else 0
+                event_loop_lag_samples = list(self.stats.event_loop_lag_ms)
                 self.http_server.status = {
                     "status": "degraded" if phase == "degraded" else "ok",
                     "phase": phase,
                     "venues": venue_payload,
                     "task_count": len(asyncio.all_tasks()),
                     "socket_count": self.manager.socket_count,
+                    "queue_depth": current_queue_depth,
+                    "queue_high_water_mark": self.stats.queue_high_water_mark,
+                    "event_loop_lag_p95_ms": _percentile(event_loop_lag_samples, 0.95),
+                    "event_loop_lag_max_ms": max(event_loop_lag_samples, default=0.0),
                 }
                 self.stats.peak_task_count = max(self.stats.peak_task_count, len(asyncio.all_tasks()))
                 latency_snapshot = self.latency.runtime_snapshot()
@@ -350,6 +389,9 @@ class TradingApplication:
     def runtime_snapshot(self) -> dict[str, Any]:
         duration = max(monotonic() - self.stats.started_at_monotonic, 0.0)
         latency_snapshot = self.latency.runtime_snapshot()
+        event_loop_lag_samples = list(self.stats.event_loop_lag_ms)
+        evaluation_latency_samples = list(self.stats.evaluation_latency_ms)
+        total_events = sum(self.stats.queue_events.values())
         return {
             "runtime_duration_seconds": duration,
             "enabled_venues": self.manager.enabled_venues,
@@ -358,12 +400,21 @@ class TradingApplication:
             "task_count": len(asyncio.all_tasks()),
             "peak_task_count": self.stats.peak_task_count,
             "queue_events": dict(self.stats.queue_events),
+            "queue_depth": self.queue.qsize() if self.queue is not None else 0,
+            "queue_high_water_mark": self.stats.queue_high_water_mark,
+            "events_processed": total_events,
+            "events_processed_per_second": total_events / duration if duration else 0.0,
             "reconnect_count_by_venue": latency_snapshot.get("reconnect_count_by_venue", {}),
             "reconnect_reason_distribution": latency_snapshot.get("reconnect_reason_distribution", {}),
+            "recent_reconnects": latency_snapshot.get("recent_reconnects", []),
             "stale_snapshot_blocks": self.stats.stale_snapshot_blocks,
             "healthy_snapshot_evaluations": self.stats.healthy_snapshot_evaluations,
             "signals_evaluated": self.stats.signals_evaluated,
             "signals_emitted": self.stats.signals_emitted,
+            "evaluation_latency_p95_ms": _percentile(evaluation_latency_samples, 0.95),
+            "evaluation_latency_max_ms": max(evaluation_latency_samples, default=0.0),
+            "event_loop_lag_p95_ms": _percentile(event_loop_lag_samples, 0.95),
+            "event_loop_lag_max_ms": max(event_loop_lag_samples, default=0.0),
             "signals_blocked_by_reason": dict(self.stats.signals_blocked_by_reason),
             "unexpected_exceptions": list(self.stats.unexpected_exceptions),
             "health": self.http_server.status,

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import hashlib
 import json
 import logging
 import random
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -18,6 +20,17 @@ from trader_dost_arun.core.models import Direction, LiquidationEvent, MarketSnap
 from trader_dost_arun.ops.latency import LatencyMonitor
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class SharedHttpResources:
+    client: httpx.AsyncClient
+    semaphore: asyncio.Semaphore
+    refs: int = 0
+
+
+class HeartbeatTimeoutError(TimeoutError):
+    pass
 
 
 def parse_ts(value: int | float | None) -> datetime:
@@ -51,6 +64,7 @@ class BasePublicConnector(abc.ABC):
     venue: str
     ws_url: str
     rest_url: str
+    _shared_http_resources: dict[str, SharedHttpResources] = {}
 
     def __init__(self, symbol: str, latency_monitor: LatencyMonitor, config: dict[str, Any]):
         self.symbol = symbol
@@ -58,7 +72,9 @@ class BasePublicConnector(abc.ABC):
         self.config = config
         self.logger = logging.getLogger(f"{__name__}.{self.venue}.{symbol}")
         self._stop = asyncio.Event()
-        self._rest_client = httpx.AsyncClient(timeout=10)
+        self._http_resources = self._acquire_shared_http_resources()
+        self._rest_client = self._http_resources.client
+        self._rest_semaphore = self._http_resources.semaphore
         self._bg_tasks: list[asyncio.Task] = []
         self._cached_mark_price: float | None = None
         self._cached_index_price: float | None = None
@@ -69,6 +85,33 @@ class BasePublicConnector(abc.ABC):
         self._cached_option_put_call_skew: float | None = None
         self._ws = None
         self._closed = False
+
+    def _acquire_shared_http_resources(self) -> SharedHttpResources:
+        state = self._shared_http_resources.get(self.venue)
+        if state is None:
+            timeout_seconds = float(self.config.get("http_timeout_seconds", 10.0))
+            limits = httpx.Limits(
+                max_connections=max(1, int(self.config.get("http_max_connections", 4))),
+                max_keepalive_connections=max(1, int(self.config.get("http_max_keepalive_connections", 2))),
+            )
+            state = SharedHttpResources(
+                client=httpx.AsyncClient(timeout=timeout_seconds, limits=limits, follow_redirects=True),
+                semaphore=asyncio.Semaphore(max(1, int(self.config.get("http_max_concurrency", 2)))),
+                refs=0,
+            )
+            self._shared_http_resources[self.venue] = state
+        state.refs += 1
+        return state
+
+    async def _release_shared_http_resources(self) -> None:
+        if self._http_resources is None:
+            return
+        state = self._http_resources
+        self._http_resources = None
+        state.refs = max(0, state.refs - 1)
+        if state.refs == 0:
+            self._shared_http_resources.pop(self.venue, None)
+            await state.client.aclose()
 
     async def stop(self) -> None:
         if self._closed:
@@ -84,7 +127,7 @@ class BasePublicConnector(abc.ABC):
             task.cancel()
         await asyncio.gather(*self._bg_tasks, return_exceptions=True)
         self._bg_tasks.clear()
-        await self._rest_client.aclose()
+        await self._release_shared_http_resources()
 
     @abc.abstractmethod
     def subscription_messages(self) -> list[dict[str, Any]]:
@@ -97,15 +140,71 @@ class BasePublicConnector(abc.ABC):
     def supplemental_streams(self, queue: asyncio.Queue) -> list[asyncio.Task]:
         return []
 
+    def _retry_after_delay(self, response: httpx.Response, attempt: int) -> float:
+        retry_after = response.headers.get("Retry-After", "").strip()
+        if retry_after.isdigit():
+            return max(0.0, float(retry_after))
+        return compute_backoff_delay(
+            attempt,
+            base_delay=float(self.config.get("http_retry_base_delay_seconds", 1.0)),
+            max_delay=float(self.config.get("http_retry_max_delay_seconds", 30.0)),
+            jitter_ratio=float(self.config.get("http_retry_jitter_ratio", 0.2)),
+        )
+
+    async def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
+        max_attempts = max(1, int(self.config.get("http_max_attempts", 3)))
+        url = f"{self.rest_url}{path}"
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with self._rest_semaphore:
+                    response = await self._rest_client.request(method, url, **kwargs)
+                if response.status_code < 400:
+                    return response.json()
+                if response.status_code in {401, 403, 404}:
+                    response.raise_for_status()
+                delay = self._retry_after_delay(response, attempt)
+                if attempt >= max_attempts:
+                    response.raise_for_status()
+                self.logger.warning(
+                    "rest retry venue=%s symbol=%s path=%s status=%s attempt=%s backoff=%.2fs",
+                    self.venue,
+                    self.symbol,
+                    path,
+                    response.status_code,
+                    attempt,
+                    delay,
+                )
+                await self._sleep_or_stop(delay)
+            except asyncio.CancelledError:
+                raise
+            except httpx.HTTPStatusError:
+                raise
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.TransportError) as exc:
+                if attempt >= max_attempts:
+                    raise
+                delay = compute_backoff_delay(
+                    attempt,
+                    base_delay=float(self.config.get("http_retry_base_delay_seconds", 1.0)),
+                    max_delay=float(self.config.get("http_retry_max_delay_seconds", 30.0)),
+                    jitter_ratio=float(self.config.get("http_retry_jitter_ratio", 0.2)),
+                )
+                self.logger.warning(
+                    "rest transient error venue=%s symbol=%s path=%s attempt=%s backoff=%.2fs error=%s",
+                    self.venue,
+                    self.symbol,
+                    path,
+                    attempt,
+                    delay,
+                    type(exc).__name__,
+                )
+                await self._sleep_or_stop(delay)
+        raise RuntimeError(f"unreachable request state for {method} {path}")
+
     async def rest_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        response = await self._rest_client.get(f"{self.rest_url}{path}", params=params)
-        response.raise_for_status()
-        return response.json()
+        return await self._request_json("GET", path, params=params)
 
     async def rest_post_json(self, path: str, payload: dict[str, Any]) -> Any:
-        response = await self._rest_client.post(f"{self.rest_url}{path}", json=payload)
-        response.raise_for_status()
-        return response.json()
+        return await self._request_json("POST", path, json=payload)
 
     def _merge_cache(self, value: float | None, cached_attr: str) -> float | None:
         cached = getattr(self, cached_attr)
@@ -138,6 +237,33 @@ class BasePublicConnector(abc.ABC):
         except asyncio.TimeoutError:
             return
 
+    def _stable_seed(self, salt: str) -> float:
+        raw = f"{self.venue}:{self.symbol}:{salt}".encode("utf-8")
+        digest = hashlib.sha1(raw).hexdigest()[:8]
+        return int(digest, 16) / 0xFFFFFFFF
+
+    async def stagger_start(self, purpose: str, max_delay_seconds: float = 3.0) -> None:
+        if max_delay_seconds <= 0:
+            return
+        await self._sleep_or_stop(self._stable_seed(purpose) * max_delay_seconds)
+
+    async def _recv_or_probe_liveness(self, websocket: Any, recv_timeout: float, ping_timeout: float) -> str | bytes | None:
+        try:
+            return await asyncio.wait_for(websocket.recv(), timeout=recv_timeout)
+        except asyncio.TimeoutError:
+            try:
+                pong_waiter = await websocket.ping()
+                await asyncio.wait_for(pong_waiter, timeout=ping_timeout)
+                self.logger.debug(
+                    "quiet feed kept alive venue=%s symbol=%s idle_timeout=%.2fs",
+                    self.venue,
+                    self.symbol,
+                    recv_timeout,
+                )
+                return None
+            except Exception as exc:  # noqa: BLE001
+                raise HeartbeatTimeoutError(str(exc)) from exc
+
     async def stream(self, queue: asyncio.Queue) -> None:
         if not self._bg_tasks:
             self._bg_tasks = self.supplemental_streams(queue)
@@ -147,6 +273,8 @@ class BasePublicConnector(abc.ABC):
         max_backoff = float(self.config.get("reconnect_max_delay_seconds", 30.0))
         jitter_ratio = float(self.config.get("reconnect_jitter_ratio", 0.2))
         recv_timeout = float(self.config.get("recv_timeout_seconds", 30.0))
+        ping_timeout = float(self.config.get("idle_ping_timeout_seconds", 10.0))
+        await self.stagger_start("ws-connect", max_delay_seconds=float(self.config.get("ws_start_stagger_seconds", 2.0)))
         try:
             while not self._stop.is_set():
                 connection_id = uuid.uuid4().hex[:12]
@@ -161,7 +289,9 @@ class BasePublicConnector(abc.ABC):
                             await websocket.send(json.dumps(message))
                         self.logger.info("connected venue=%s symbol=%s connection_id=%s", self.venue, self.symbol, connection_id)
                         while not self._stop.is_set():
-                            raw = await asyncio.wait_for(websocket.recv(), timeout=recv_timeout)
+                            raw = await self._recv_or_probe_liveness(websocket, recv_timeout=recv_timeout, ping_timeout=ping_timeout)
+                            if raw is None:
+                                continue
                             last_message_at = time.monotonic()
                             self.latency_monitor.record_message(self.venue, self.symbol)
                             payload = json.loads(raw)
@@ -174,14 +304,14 @@ class BasePublicConnector(abc.ABC):
                     reason = "socket_closed"
                 except asyncio.CancelledError:
                     raise
-                except asyncio.TimeoutError:
-                    reason = "recv_timeout"
+                except HeartbeatTimeoutError:
+                    reason = "heartbeat_timeout"
                 except ConnectionClosed as exc:
                     reason = f"connection_closed:{exc.code}"
                 except Exception as exc:  # noqa: BLE001
                     reason = type(exc).__name__
                     self.latency_monitor.error(self.venue, self.symbol)
-                    self.logger.warning("connector error venue=%s symbol=%s connection_id=%s error=%s", self.venue, self.symbol, connection_id, exc)
+                    self.logger.warning("connector error venue=%s symbol=%s connection_id=%s error=%s", self.venue, self.symbol, connection_id, type(exc).__name__)
                 finally:
                     self._ws = None
                 if self._stop.is_set():

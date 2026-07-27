@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from statistics import median
 from typing import Any
@@ -111,6 +111,11 @@ class LatencyMonitor:
             "sample_count": float(len(values)),
         }
 
+    def _serialize_reconnect_event(self, event: ReconnectEvent) -> dict[str, Any]:
+        payload = asdict(event)
+        payload["timestamp"] = event.timestamp.isoformat()
+        return payload
+
     def runtime_snapshot(self) -> dict[str, Any]:
         reconnects_by_venue: dict[str, int] = defaultdict(int)
         for key, value in self.feed_reconnects.items():
@@ -121,5 +126,5 @@ class LatencyMonitor:
             "reconnect_reason_distribution": dict(self.reconnect_reason_counts),
             "feed_reconnects": dict(self.feed_reconnects),
             "stable_retry_resets": dict(self.stable_resets),
-            "recent_reconnects": [event.__dict__ for event in self.reconnect_events],
+            "recent_reconnects": [self._serialize_reconnect_event(event) for event in self.reconnect_events],
         }

@@ -25,6 +25,7 @@ class HyperliquidConnector(BasePublicConnector):
 
     async def _poll_asset_context(self, queue: asyncio.Queue) -> None:
         interval = int(self.config.get("open_interest_poll_seconds", 15))
+        await self.stagger_start("asset-context-poll", max_delay_seconds=min(float(interval), 5.0))
         while not self._stop.is_set():
             try:
                 payload = await self.rest_post_json("/info", {"type": "metaAndAssetCtxs"})

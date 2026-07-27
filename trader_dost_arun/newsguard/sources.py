@@ -14,6 +14,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from trader_dost_arun.newsguard.models import NewsEvent
+from trader_dost_arun.ops.logging_utils import CooldownDeduper
 
 LOGGER = logging.getLogger(__name__)
 
@@ -46,9 +47,15 @@ class BaseNewsSource:
     def __init__(self, name: str, client: httpx.AsyncClient) -> None:
         self.name = name
         self.client = client
+        self._failure_deduper = CooldownDeduper(default_cooldown_seconds=300.0)
 
     async def fetch(self) -> list[RawNewsItem]:
         raise NotImplementedError
+
+    def _log_failure(self, detail: str) -> None:
+        key = f"{self.name}:{detail}"
+        if self._failure_deduper.should_emit(key):
+            LOGGER.warning("news source %s failed: %s", self.name, detail)
 
     def infer_symbols(self, text: str) -> list[str]:
         normalized = text.upper()
@@ -97,21 +104,43 @@ class RSSNewsSource(BaseNewsSource):
         self.url = url
         self.source_type = source_type
 
+    def _looks_like_rss(self, text: str, content_type: str) -> bool:
+        preview = text.lstrip()[:400].lower()
+        return "xml" in content_type or "<rss" in preview or "<feed" in preview or "<rdf" in preview
+
     async def fetch(self) -> list[RawNewsItem]:
         try:
             response = await self.client.get(self.url, follow_redirects=True)
             response.raise_for_status()
-            root = ElementTree.fromstring(response.text)
         except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("rss source %s failed: %s", self.name, exc)
+            self._log_failure(f"rss fetch error: {type(exc).__name__}")
+            return []
+        content_type = response.headers.get("content-type", "").lower()
+        text = response.text.strip()
+        if not text:
+            self._log_failure("rss empty body")
+            return []
+        if not self._looks_like_rss(text, content_type):
+            self._log_failure(f"rss malformed response content-type={content_type or 'unknown'}")
+            return []
+        try:
+            root = ElementTree.fromstring(text)
+        except Exception as exc:  # noqa: BLE001
+            self._log_failure(f"rss parse error: {type(exc).__name__}")
             return []
         items = root.findall(".//item")[:20]
+        if not items and root.tag.lower().endswith("feed"):
+            items = root.findall(".//{*}entry")[:20]
         results: list[RawNewsItem] = []
         for item in items:
-            title = unescape(item.findtext("title", default="")).strip()
-            summary = re.sub(r"<[^>]+>", " ", item.findtext("description", default="")).strip()
+            title = unescape(item.findtext("title", default="") or item.findtext("{*}title", default="")).strip()
+            summary = re.sub(r"<[^>]+>", " ", item.findtext("description", default="") or item.findtext("{*}summary", default="")).strip()
             link = item.findtext("link", default="").strip()
-            published = item.findtext("pubDate") or item.findtext("published") or item.findtext("updated")
+            if not link:
+                link_node = item.find("{*}link")
+                if link_node is not None:
+                    link = (link_node.get("href") or "").strip()
+            published = item.findtext("pubDate") or item.findtext("published") or item.findtext("updated") or item.findtext("{*}published") or item.findtext("{*}updated")
             published_at = parsedate_to_datetime(published).astimezone(timezone.utc) if published else datetime.now(timezone.utc)
             results.append(RawNewsItem(title=title, summary=summary, url=link, source_type=self.source_type, source_name=self.name, published_at=published_at))
         return results
@@ -128,7 +157,7 @@ class TelegramChannelSource(BaseNewsSource):
             response.raise_for_status()
             soup = BeautifulSoup(response.text, "html.parser")
         except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("telegram source %s failed: %s", self.name, exc)
+            self._log_failure(f"telegram fetch error: {type(exc).__name__}")
             return []
         messages = soup.select("div.tgme_widget_message")[:10]
         results: list[RawNewsItem] = []
@@ -175,7 +204,7 @@ class EtherscanWhaleSource(BaseNewsSource):
                 response.raise_for_status()
                 rows = response.json().get("result", [])
             except Exception as exc:  # noqa: BLE001
-                LOGGER.warning("etherscan whale source %s address %s failed: %s", self.name, address, exc)
+                self._log_failure(f"etherscan fetch error address={address[:8]} type={type(exc).__name__}")
                 continue
             for row in rows:
                 value_eth = float(row.get("value", 0.0)) / 1e18
