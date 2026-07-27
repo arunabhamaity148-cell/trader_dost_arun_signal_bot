@@ -1,40 +1,78 @@
 # Runtime Verification
 
-- Duration seconds: 101.3
-- Enabled venues: binance, bybit, deribit, hyperliquid, okx
-- Enabled symbols: BTCUSDT, BTCUSDT, BTC-USDT-SWAP, BTC-PERP, BTC-PERPETUAL
-- Socket count: 5
-- Peak task count: 22
-- Reconnect count by venue: {}
-- Reconnect reasons: {}
-- Stale snapshot blocks: 33
-- Healthy snapshot evaluations: 416
-- Signals evaluated: 443
-- Signals emitted: 0
-- Signals blocked by reason: {'cross_venue_dispersion': 96, 'spread_depth_deterioration': 185, 'exchange_instability': 236, 'stale_snapshot': 33, 'wrong_leverage_regime': 52, 'volatility_anomaly': 21}
-- Unexpected exceptions: []
-- Final health payload: {'status': 'ok', 'phase': 'healthy', 'venues': {'binance': {'score': 96.36568523289093, 'status': 'healthy', 'p95_latency_ms': 131.46465, 'stale_seconds': 0.050336, 'reconnect_count': 0, 'sample_count': 1000}, 'bybit': {'score': 95.88130173289092, 'status': 'healthy', 'p95_latency_ms': 187.8156, 'stale_seconds': 0.010773, 'reconnect_count': 0, 'sample_count': 1000}, 'deribit': {'score': 94.15994623289092, 'status': 'healthy', 'p95_latency_ms': 312.04575, 'stale_seconds': 0.2503, 'reconnect_count': 0, 'sample_count': 646}, 'hyperliquid': {'score': 71.57345173289092, 'status': 'healthy', 'p95_latency_ms': 10850.411299999985, 'stale_seconds': 0.603776, 'reconnect_count': 0, 'sample_count': 287}, 'okx': {'score': 96.09127873289093, 'status': 'healthy', 'p95_latency_ms': 164.9639, 'stale_seconds': 0.020043, 'reconnect_count': 0, 'sample_count': 1000}}, 'task_count': 20, 'socket_count': 5}
-- Pending tasks after stop: []
-- Shutdown markers: {'task_destroyed': False, 'event_loop_closed': False, 'task_exception_never_retrieved': False}
+## Final runtime status
+**PARTIALLY VERIFIED**
 
-## Health samples
-- t=10s: `{"status": "ok", "phase": "healthy", "venues": {"binance": {"score": 98.03447546564885, "status": "healthy", "p95_latency_ms": 103.47120000000001, "stale_seconds": 0.007391, "reconnect_count": 0, "sample_count": 789}, "bybit": {"score": 97.55859246564884, "status": "healthy", "p95_latency_ms": 149.4201, "stale_seconds": 0.015588, "reconnect_count": 0, "sample_count": 1000}, "deribit": {"score": 95.64034146564885, "status": "healthy", "p95_latency_ms": 297.8807999999999, "stale_seconds": 0.23241, "reconnect_count": 0, "sample_count": 137}, "hyperliquid": {"score": 73.26936946564885, "status": "healthy", "p95_latency_ms": 14990.097799999996, "stale_seconds": 0.4073, "reconnect_count": 0, "sample_count": 95}, "okx": {"score": 97.93228546564885, "status": "healthy", "p95_latency_ms": 113.59200000000001, "stale_seconds": 0.007882, "reconnect_count": 0, "sample_count": 387}}, "task_count": 20, "socket_count": 5}`
-- t=20s: `{"status": "ok", "phase": "healthy", "venues": {"binance": {"score": 96.75614485714286, "status": "healthy", "p95_latency_ms": 209.73059999999998, "stale_seconds": 0.001846, "reconnect_count": 0, "sample_count": 1000}, "bybit": {"score": 97.84877235714286, "status": "healthy", "p95_latency_ms": 99.41905, "stale_seconds": 0.00709, "reconnect_count": 0, "sample_count": 1000}, "deribit": {"score": 95.66045985714287, "status": "healthy", "p95_latency_ms": 304.9827, "stale_seconds": 0.073428, "reconnect_count": 0, "sample_count": 207}, "hyperliquid": {"score": 73.49009285714286, "status": "healthy", "p95_latency_ms": 14707.1978, "stale_seconds": 0.183525, "reconnect_count": 0, "sample_count": 123}, "okx": {"score": 97.58374685714287, "status": "healthy", "p95_latency_ms": 117.17020000000005, "stale_seconds": 0.050847, "reconnect_count": 0, "sample_count": 589}}, "task_count": 20, "socket_count": 5}`
-- t=30s: `{"status": "ok", "phase": "healthy", "venues": {"binance": {"score": 96.4331881699029, "status": "healthy", "p95_latency_ms": 209.71955, "stale_seconds": 0.066847, "reconnect_count": 0, "sample_count": 1000}, "bybit": {"score": 97.56336416990291, "status": "healthy", "p95_latency_ms": 107.69614999999999, "stale_seconds": 0.011876, "reconnect_count": 0, "sample_count": 1000}, "deribit": {"score": 95.26359266990292, "status": "healthy", "p95_latency_ms": 304.9827, "stale_seconds": 0.175329, "reconnect_count": 0, "sample_count": 267}, "hyperliquid": {"score": 73.52881166990291, "status": "healthy", "p95_latency_ms": 14493.396999999983, "stale_seconds": 0.067633, "reconnect_count": 0, "sample_count": 145}, "okx": {"score": 97.4087596699029, "status": "healthy", "p95_latency_ms": 114.96, "stale_seconds": 0.052859, "reconnect_count": 0, "sample_count": 863}}, "task_count": 20, "socket_count": 5}`
-- t=40s: `{"status": "ok", "phase": "healthy", "venues": {"binance": {"score": 96.43127361649294, "status": "healthy", "p95_latency_ms": 209.69565, "stale_seconds": 0.00014, "reconnect_count": 0, "sample_count": 1000}, "bybit": {"score": 97.36386761649294, "status": "healthy", "p95_latency_ms": 116.35645000000001, "stale_seconds": 0.000539, "reconnect_count": 0, "sample_count": 1000}, "deribit": {"score": 94.86006911649295, "status": "healthy", "p95_latency_ms": 304.98089999999996, "stale_seconds": 0.309316, "reconnect_count": 0, "sample_count": 332}, "hyperliquid": {"score": 71.81722211649296, "status": "healthy", "p95_latency_ms": 13365.953249999991, "stale_seconds": 0.855644, "reconnect_count": 0, "sample_count": 170}, "okx": {"score": 97.32571861649295, "status": "healthy", "p95_latency_ms": 120.11835, "stale_seconds": 0.000804, "reconnect_count": 0, "sample_count": 1000}}, "task_count": 22, "socket_count": 5}`
-- t=50s: `{"status": "ok", "phase": "healthy", "venues": {"binance": {"score": 96.8309606664853, "status": "healthy", "p95_latency_ms": 130.77865, "stale_seconds": 0.122683, "reconnect_count": 0, "sample_count": 1000}, "bybit": {"score": 96.7949741664853, "status": "healthy", "p95_latency_ms": 158.8111, "stale_seconds": 0.000514, "reconnect_count": 0, "sample_count": 1000}, "deribit": {"score": 95.3325621664853, "status": "healthy", "p95_latency_ms": 304.9819, "stale_seconds": 0.000866, "reconnect_count": 0, "sample_count": 402}, "hyperliquid": {"score": 72.14426516648531, "status": "healthy", "p95_latency_ms": 13033.2047, "stale_seconds": 0.619924, "reconnect_count": 0, "sample_count": 194}, "okx": {"score": 96.58714516648531, "status": "healthy", "p95_latency_ms": 155.0418, "stale_seconds": 0.123275, "reconnect_count": 0, "sample_count": 1000}}, "task_count": 21, "socket_count": 5}`
-- t=60s: `{"status": "ok", "phase": "healthy", "venues": {"binance": {"score": 96.90578602118003, "status": "healthy", "p95_latency_ms": 130.83679999999995, "stale_seconds": 0.000336, "reconnect_count": 0, "sample_count": 1000}, "bybit": {"score": 96.86858252118003, "status": "healthy", "p95_latency_ms": 134.51734999999996, "stale_seconds": 0.000535, "reconnect_count": 0, "sample_count": 1000}, "deribit": {"score": 95.16328352118002, "status": "healthy", "p95_latency_ms": 304.98285, "stale_seconds": 0.000857, "reconnect_count": 0, "sample_count": 464}, "hyperliquid": {"score": 73.15336002118003, "status": "healthy", "p95_latency_ms": 11517.608399999992, "stale_seconds": 0.030733, "reconnect_count": 0, "sample_count": 239}, "okx": {"score": 96.66237602118004, "status": "healthy", "p95_latency_ms": 155.0418, "stale_seconds": 0.001016, "reconnect_count": 0, "sample_count": 1000}}, "task_count": 21, "socket_count": 5}`
-- t=70s: `{"status": "ok", "phase": "healthy", "venues": {"binance": {"score": 96.67684929203958, "status": "healthy", "p95_latency_ms": 131.3637, "stale_seconds": 0.036787, "reconnect_count": 0, "sample_count": 1000}, "bybit": {"score": 96.11050829203957, "status": "healthy", "p95_latency_ms": 155.03439999999998, "stale_seconds": 0.201604, "reconnect_count": 0, "sample_count": 1000}, "deribit": {"score": 94.64381579203958, "status": "healthy", "p95_latency_ms": 312.08305, "stale_seconds": 0.149707, "reconnect_count": 0, "sample_count": 524}, "hyperliquid": {"score": 71.58034029203957, "status": "healthy", "p95_latency_ms": 11349.2083, "stale_seconds": 0.74186, "reconnect_count": 0, "sample_count": 255}, "okx": {"score": 96.50947679203958, "status": "healthy", "p95_latency_ms": 155.23595000000003, "stale_seconds": 0.001112, "reconnect_count": 0, "sample_count": 1000}}, "task_count": 21, "socket_count": 5}`
-- t=80s: `{"status": "ok", "phase": "healthy", "venues": {"binance": {"score": 96.38301981236202, "status": "healthy", "p95_latency_ms": 131.3637, "stale_seconds": 0.114144, "reconnect_count": 0, "sample_count": 1000}, "bybit": {"score": 96.11885231236202, "status": "healthy", "p95_latency_ms": 178.49085, "stale_seconds": 0.010592, "reconnect_count": 0, "sample_count": 1000}, "deribit": {"score": 94.59465081236202, "status": "healthy", "p95_latency_ms": 312.21099999999996, "stale_seconds": 0.104092, "reconnect_count": 0, "sample_count": 585}, "hyperliquid": {"score": 72.65316081236203, "status": "healthy", "p95_latency_ms": 11294.409199999998, "stale_seconds": 0.135892, "reconnect_count": 0, "sample_count": 269}, "okx": {"score": 96.32031231236202, "status": "healthy", "p95_latency_ms": 155.22265, "stale_seconds": 0.026203, "reconnect_count": 0, "sample_count": 1000}}, "task_count": 20, "socket_count": 5}`
-- t=90s: `{"status": "ok", "phase": "healthy", "venues": {"binance": {"score": 96.36568523289093, "status": "healthy", "p95_latency_ms": 131.46465, "stale_seconds": 0.050336, "reconnect_count": 0, "sample_count": 1000}, "bybit": {"score": 95.88130173289092, "status": "healthy", "p95_latency_ms": 187.8156, "stale_seconds": 0.010773, "reconnect_count": 0, "sample_count": 1000}, "deribit": {"score": 94.15994623289092, "status": "healthy", "p95_latency_ms": 312.04575, "stale_seconds": 0.2503, "reconnect_count": 0, "sample_count": 646}, "hyperliquid": {"score": 71.57345173289092, "status": "healthy", "p95_latency_ms": 10850.411299999985, "stale_seconds": 0.603776, "reconnect_count": 0, "sample_count": 287}, "okx": {"score": 96.09127873289093, "status": "healthy", "p95_latency_ms": 164.9639, "stale_seconds": 0.020043, "reconnect_count": 0, "sample_count": 1000}}, "task_count": 20, "socket_count": 5}`
+A short live smoke test against public market-data venues succeeded. A required 15-minute full-watchlist soak test was **not run** in this sandbox, so the repository is **not** marked production-ready.
 
-## Metrics samples
-- t=10s metrics_ok=True
-- t=20s metrics_ok=True
-- t=30s metrics_ok=True
-- t=40s metrics_ok=True
-- t=50s metrics_ok=True
-- t=60s metrics_ok=True
-- t=70s metrics_ok=True
-- t=80s metrics_ok=True
-- t=90s metrics_ok=True
+## Smoke test
+### Command
+```bash
+python3 run_smoke_verification.py > smoke_output.json
+```
+
+### Scope
+- Duration: ~20 seconds live runtime (+ startup/shutdown overhead)
+- Watchlist used:
+  - Binance: `BTCUSDT`
+  - Bybit: `BTCUSDT`
+  - OKX: `BTC-USDT-SWAP`
+- No trading credentials used
+- No order placement attempted
+
+### Smoke result
+**PASS**
+
+### Observed quantitative metrics
+From `smoke_output.json`:
+- Runtime duration: **28.48s**
+- Queue events processed: **1777**
+  - Snapshots: **1242**
+  - Trades: **535**
+- Events/sec: **62.40**
+- Queue high-water mark: **108**
+- Peak task count: **15**
+- Signals evaluated: **60**
+- Signals emitted: **0**
+- Healthy snapshot evaluations: **60**
+- Unexpected exceptions: **0**
+- Network degraded transitions: **0**
+- Reconnect count by venue: **0** during smoke window
+- Health phase: **healthy**
+- Event-loop lag p95: **2.08 ms**
+- Evaluation latency p95: **70.35 ms**
+
+### Venue health during smoke
+- Binance: healthy, score **98.55**, p95 latency **80.35 ms**, samples **453**
+- Bybit: healthy, score **98.72**, p95 latency **81.78 ms**, samples **978**
+- OKX: healthy, score **98.53**, p95 latency **86.97 ms**, samples **318**
+
+### Observed optional-enrichment limitation
+- Binance open-interest REST polling returned HTTP **451** in this environment.
+- The poll failure was isolated and did **not** crash websocket ingestion, signal evaluation, health reporting, or shutdown.
+
+## Shutdown verification
+### Result
+**PASS** for the smoke-run path
+
+### Observed properties
+- Application stopped without `KeyboardInterrupt` traceback from the smoke script
+- No `CancelledError` traceback surfaced during normal shutdown
+- Runtime snapshot after shutdown showed no active sockets in the manager
+- No unexpected exceptions were recorded
+
+## 15-minute full-watchlist soak test
+### Result
+**NOT RUN**
+
+### Reason
+This sandbox session prioritized code repair, regression coverage, and artifact validation. A 15-minute full-watchlist public-network soak was not completed within the available execution budget.
+
+## Known runtime limitations
+1. No full-watchlist 15-minute soak evidence in this package
+2. No venue-specific websocket multiplex refactor was implemented
+3. Clean-room dependency installation was not fully completed in the sandbox because the full `pip install -r requirements.txt` attempt timed out
+4. Public REST enrichment can still be venue-blocked externally (example: Binance HTTP 451), but failures are now isolated from core ingestion
+
+## Final runtime classification
+**REPAIRED — PARTIALLY VERIFIED**

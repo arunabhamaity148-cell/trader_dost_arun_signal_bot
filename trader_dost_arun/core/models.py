@@ -66,6 +66,11 @@ class MarketSnapshot:
     option_atm_iv: float | None = None
     option_put_call_skew: float | None = None
     arrival_time: datetime = field(default_factory=utc_now)
+    core_event_time: datetime | None = None
+    core_arrival_time: datetime | None = None
+    enrichment_event_time: datetime | None = None
+    enrichment_arrival_time: datetime | None = None
+    update_class: str = "core"
 
     @property
     def mid_price(self) -> float | None:

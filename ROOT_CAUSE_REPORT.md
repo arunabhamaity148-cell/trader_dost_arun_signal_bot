@@ -1,179 +1,66 @@
-# ROOT CAUSE REPORT
+# Root Cause Report
 
-## Scope
-This report documents the fixes applied to the uploaded `trader_dost_arun_signal_bot-main.zip` working copy, not to any previous temporary sandbox tree.
+## Final status
+Repaired and test-verified in the sandbox. Live smoke test passed for a short public-market-data run. A 15-minute full-watchlist soak test was **not run** in this environment, so this repository is **not** marked production-ready.
 
-## 1. Event-loop load / reconnect churn
-**Status: VERIFIED by code inspection, then live post-fix stability verified.**
+## Confirmed root causes and repairs
 
-### Root cause
-`app.py` previously consumed every queue event inline and ran the full signal pipeline directly on the main asyncio loop for each `MarketSnapshot`, `Trade`, and `LiquidationEvent`.
-That design combined:
-- high-frequency websocket ingestion,
-- synchronous feature calculation,
-- peer feature fan-out,
-- regime updates,
-- veto/risk/strategy evaluation,
-- alert/log handling,
+### 1. Core freshness was coupled to optional enrichment
+- **Root cause:** optional REST enrichment snapshots reused the same `MarketSnapshot` channel as websocket market data, so enrichment updates could make a stale feed appear fresh.
+- **Affected files:** `trader_dost_arun/core/models.py`, `trader_dost_arun/core/state.py`, `trader_dost_arun/data/base.py`, `app.py`
+- **Repair:** added explicit `core_event_time`, `core_arrival_time`, `enrichment_event_time`, `enrichment_arrival_time`, and `update_class` fields; changed freshness evaluation to age only the last valid core market update; exposed enrichment/core age diagnostics.
+- **Why this works:** optional OI/options/context updates no longer refresh core market freshness, so stale core data remains fail-closed while fresh core + stale optional data stays usable.
+- **Remaining limitation:** strategies still consume merged snapshots, but freshness gating now differentiates required vs optional inputs.
 
-inside the same latency-sensitive event loop path.
+### 2. Reconnect control lacked systemic network/DNS degradation awareness
+- **Root cause:** connectors treated venue-local failures and cross-venue transport failures the same way, so repeated DNS/timeout/connect failures could trigger aggressive reconnect behavior.
+- **Affected files:** `trader_dost_arun/ops/latency.py`, `trader_dost_arun/data/base.py`, `app.py`
+- **Repair:** added systemic transport-error classification, cross-venue degradation detection, recovery tracking, active-connection ownership tracking, and degraded reconnect backoff handling.
+- **Why this works:** the runtime now distinguishes likely global network degradation from venue-local instability and lengthens recovery cadence during degraded periods.
+- **Remaining limitation:** this is heuristic detection based on recent failures and venue diversity, not an external network probe.
 
-With one connector task per `venue × symbol`, this made receive loops vulnerable to starvation and stale-state cascades under load.
+### 3. Connector/task ownership and shutdown idempotence were weak
+- **Root cause:** connector startup was not idempotent, duplicate feed definitions could create duplicate loops, and cancellation semantics could propagate noisy shutdown behavior.
+- **Affected files:** `trader_dost_arun/data/manager.py`, `trader_dost_arun/ops/latency.py`, `app.py`, venue connector pollers
+- **Repair:** made manager startup idempotent, deduplicated watchlist feeds, tracked active connection owners, made poller sleeps stop-aware, and changed `run_forever()` / `stop()` to drain cleanly and idempotently.
+- **Why this works:** duplicate connector loops are prevented at manager level, reconnects are suppressed after shutdown, and background tasks drain with `gather(..., return_exceptions=True)`.
+- **Remaining limitation:** the architecture still uses one websocket per feed; this repair focuses on bounded/recoverable behavior rather than a full venue-specific multiplex refactor.
 
-### Fix
-- Replaced direct per-event inline evaluation with a **coalescing signal-evaluation scheduler**.
-- Kept **state ingestion real-time**, but moved expensive feature fan-out off the hot ingest path.
-- Added a **controlled per-symbol evaluation cadence** (`system.signal_evaluation_interval_seconds`).
-- Coalesced bursty event streams so trade/liquidation bursts do not trigger redundant full evaluations.
-- Kept open-position monitoring on snapshot updates.
-- Added runtime counters for evaluations, blocks, sockets, tasks, and health.
+### 4. REST enrichment pressure was only partially controlled
+- **Root cause:** per-symbol enrichment loops shared no pacing or circuit-breaking beyond basic retries.
+- **Affected files:** `trader_dost_arun/data/base.py`, venue connector modules
+- **Repair:** added shared per-venue semaphore use, per-venue request pacing, bounded retry budgets, circuit-breaker cooldown, transport-failure classification, and stop-aware polling.
+- **Why this works:** optional enrichment can no longer burst unbounded concurrent requests or keep hammering a failing venue during repeated transport errors.
+- **Remaining limitation:** enrichment polling is still connector-local, not a single centralized per-venue poller.
 
-### Connector hardening
-- Added structured reconnect instrumentation with:
-  - venue
-  - symbol
-  - connection_id
-  - reason
-  - uptime
-  - last_message_age
-  - attempt
-  - backoff
-- Added **bounded exponential backoff with jitter**.
-- Added **retry reset after a stable connection window**.
-- Connector shutdown now closes websocket/client resources cleanly.
+### 5. Logging integrity and secret redaction were incomplete
+- **Root cause:** logging did not guarantee single-line records and traceback/credential redaction coverage was incomplete.
+- **Affected files:** `trader_dost_arun/ops/logging_utils.py`
+- **Repair:** added queue-based logging fan-in, single-line sanitizing formatters, traceback sanitization, Telegram token/chat-id redaction, URL credential redaction, query/header/bearer redaction.
+- **Why this works:** concurrent log writes now serialize through a queue listener and all rendered output is sanitized before emission.
+- **Remaining limitation:** application code that prints directly to stdout/stderr outside logging is not intercepted.
 
-### Evidence
-- Full live verification completed with **5 live sockets** and **0 reconnects**.
-- `/health` and `/metrics` remained responsive throughout the run.
-- No `Task was destroyed but it is pending!`
-- No `Event loop is closed`
-- No `Task exception was never retrieved`
+### 6. NewsGuard source failures needed stronger isolation
+- **Root cause:** malformed/empty/unavailable sources could fail repeatedly without explicit per-source cooldown state.
+- **Affected files:** `trader_dost_arun/newsguard/sources.py`, `trader_dost_arun/newsguard/guard.py`
+- **Repair:** added source health state, cooldown/backoff, retry-budget tracking, skip-during-cooldown behavior, calendar-source isolation, and per-item normalization failure isolation.
+- **Why this works:** one broken RSS/Telegram/on-chain source no longer spams retries or blocks other sources and refresh passes.
+- **Remaining limitation:** cooldown state is in-memory and resets on process restart.
 
-## 2. Cross-venue symbol alias / freshness quorum
-**Status: VERIFIED by code inspection and regression tests.**
+### 7. Clean-environment import resilience for dotenv
+- **Root cause:** repository import failed immediately when `python-dotenv` was absent even though `.env` loading is optional for tests and some runtime paths.
+- **Affected files:** `trader_dost_arun/core/config.py`, `requirements.txt`
+- **Repair:** kept `python-dotenv` declared in `requirements.txt` and added a safe fallback no-op loader if the dependency is unavailable.
+- **Why this works:** test/import paths no longer hard-fail solely because `.env` support is missing, while real environments still use `python-dotenv` when installed.
+- **Remaining limitation:** a truly clean production deployment should still install dependencies from `requirements.txt`.
 
-### Root cause
-`MarketStateStore.peer_views()` previously matched peers by exact symbol string equality. That broke cross-venue reasoning for equivalent perpetual instruments such as:
-- `BTCUSDT`
-- `BTC-USDT-SWAP`
-- `BTC-PERP`
-- `BTC-PERPETUAL`
+## Trading-logic preservation
+No signal thresholds, direction rules, TP/SL rules, leverage formulas, risk-engine rules, NewsGuard decision rules, or watchlist semantics were intentionally changed. Repairs were limited to infrastructure, freshness semantics, retries, shutdown behavior, and observability.
 
-### Fix
-- Added `trader_dost_arun/core/symbols.py` with structured instrument normalization.
-- Normalization now reasons about:
-  - base asset
-  - quote asset / quote class
-  - instrument type
-- `peer_views()` now groups peers by canonical instrument identity instead of raw string equality.
-- Added explicit **freshness quorum** logic in `MarketStateStore.freshness()`.
-- `stale_snapshot` safety is preserved and now uses canonical peer identity correctly.
+## Not fully completed in this environment
+- No full 15-minute full-watchlist soak run
+- No clean-room `pip install -r requirements.txt` completion inside this sandbox (attempt timed out)
+- No venue-specific websocket multiplex refactor
 
-### Evidence
-Regression tests cover:
-- alias normalization
-- peer alias recovery
-- quorum degradation
-- quorum recovery
-- stale block / stale recovery
-
-## 3. HMM / regime NaN crash
-**Status: VERIFIED by code inspection and regression tests.**
-
-### Root cause
-The regime detector could accept invalid numerical inputs into its sample matrix and background HMM fit path. That created two risks:
-- `hmmlearn` fit failures from `NaN` / `inf`
-- background task failures surfacing as `Task exception was never retrieved`
-
-### Fix
-- Added validation for regime samples before insertion.
-- Invalid numerical samples are **rejected**, not coerced into fake values.
-- Fit matrices are sanitized to finite rows only.
-- If valid sample history is insufficient, detector stays in the safe fallback / warmup regime.
-- Background fit task completion is explicitly consumed and exceptions are handled.
-- Prediction failures now fall back safely without leaking task exceptions.
-
-### Evidence
-Regression tests cover:
-- NaN rejection
-- inf rejection
-- insufficient-history fallback
-- fit-exception handling
-- successful fit path
-
-## 4. Log / Telegram alert spam
-**Status: VERIFIED by prior runtime evidence and fixed.**
-
-### Root cause
-Repeated warning paths could emit the same health/suppression messages many times in tight loops.
-
-### Fix
-- Added reusable `CooldownDeduper`.
-- Applied cooldown-based deduplication to:
-  - repeated suppression logs
-  - repeated Telegram health alerts
-  - repeated Telegram-disabled status logs
-- Safety checks still run every cycle; only the **notification/log emission** is cooled down.
-
-## 5. Windows Unicode logging
-**Status: VERIFIED by code inspection and regression tests.**
-
-### Root cause
-Standard console logging could raise `UnicodeEncodeError` on Windows consoles with limited encodings when emoji/unicode log messages were emitted.
-
-### Fix
-- Added `SafeStreamHandler` with encoding fallback using `backslashreplace`.
-- Explicitly configured file handlers with `encoding="utf-8"`.
-- Disabled logging exception propagation from interfering with the app.
-
-## 6. Graceful shutdown / resource ownership
-**Status: VERIFIED in live runtime verification.**
-
-### Root cause
-Connector shutdown relied too heavily on task cancellation instead of explicit resource stop ownership.
-
-### Fix
-- `ConnectorManager` now owns connector instances and stops them explicitly.
-- Connectors close websocket + background tasks + HTTP client cleanly.
-- App shutdown now stops, in order:
-  1. evaluation scheduler
-  2. background consumer/health tasks
-  3. Telegram bot
-  4. HTTP ops server
-  5. NewsGuard
-  6. external context client
-  7. connector manager
-
-## 7. Health / metrics classification
-**Status: VERIFIED by tests and live verification.**
-
-### Improvements
-- Added startup/warmup/healthy/degraded health classification.
-- Avoided misleading percentile handling for tiny sample sets.
-- `/health` now distinguishes operational status from lifecycle phase.
-- `/metrics` remained responsive during the sustained run.
-
-## 8. Telegram failure safety
-**Status: VERIFIED by regression tests and code inspection.**
-
-### Fix
-- Startup logs clearly state `Telegram ENABLED` or `Telegram DISABLED - safe reason`.
-- Telegram send/poll failures are caught and logged without crashing the engine.
-- No secrets are logged.
-
-## 9. Security / secrets
-**Status: VERIFIED for delivered artifact.**
-
-### Fix
-- Preserved `.env.example` as the safe template.
-- Added `TELEGRAM_ADMIN_CHAT_ID` to `.env.example`.
-- Final packaging excludes real `.env`, sqlite databases, logs, caches, and virtualenv files.
-
-## Acceptance summary
-- Event-loop starvation design issue: **fixed**
-- Symbol aliasing / freshness quorum: **fixed**
-- HMM NaN / background exception risk: **fixed**
-- Alert/log spam: **fixed**
-- Windows unicode logging: **fixed**
-- Graceful shutdown: **verified live**
-- Secrets in final ZIP: **excluded**
+## Resulting status
+**REPAIRED — PARTIALLY VERIFIED**

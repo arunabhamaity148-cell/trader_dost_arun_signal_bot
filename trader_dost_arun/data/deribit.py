@@ -33,7 +33,7 @@ class DeribitConnector(BasePublicConnector):
                 raise
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning("deribit options poll failed: %s", exc)
-            await asyncio.sleep(interval)
+            await self._sleep_or_stop(interval)
 
     def _compute_option_metrics(self, rows: list[dict]) -> dict[str, float] | None:
         best_by_expiry: dict[str, dict[str, dict]] = defaultdict(dict)

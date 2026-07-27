@@ -156,6 +156,7 @@ class TradingApplication:
         )
         self.queue: asyncio.Queue | None = None
         self._stop = asyncio.Event()
+        self._stopping = False
         self._background_tasks: list[asyncio.Task] = []
         self._evaluation_scheduler = SignalEvaluationScheduler(
             self._evaluate_symbol,
@@ -204,25 +205,28 @@ class TradingApplication:
             await self._stop.wait()
         except asyncio.CancelledError:
             LOGGER.info("shutdown requested")
-            raise
         finally:
             await self.stop()
 
     async def stop(self) -> None:
-        if self._stop.is_set() and self.queue is None:
+        if self._stopping:
             return
+        self._stopping = True
         self._stop.set()
-        await self._evaluation_scheduler.stop()
-        for task in self._background_tasks:
-            task.cancel()
-        await asyncio.gather(*self._background_tasks, return_exceptions=True)
-        self._background_tasks.clear()
-        await self.bot.stop()
-        await self.http_server.stop()
-        await self.news_guard.close()
-        await self.external_client.close()
-        await self.manager.stop()
-        self.queue = None
+        try:
+            await self._evaluation_scheduler.stop()
+            for task in self._background_tasks:
+                task.cancel()
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            self._background_tasks.clear()
+            await self.bot.stop()
+            await self.http_server.stop()
+            await self.news_guard.close()
+            await self.external_client.close()
+            await self.manager.stop()
+            self.queue = None
+        finally:
+            self._stopping = False
 
     async def _consume_market_data(self) -> None:
         assert self.queue is not None
@@ -274,6 +278,13 @@ class TradingApplication:
                 }
             )
             external = self.external_client.current_context()
+            feature_map.values.update(
+                {
+                    "core_age_seconds": freshness.own_age_seconds if freshness.own_age_seconds is not None else 999.0,
+                    "enrichment_age_seconds": freshness.own_enrichment_age_seconds if freshness.own_enrichment_age_seconds is not None else 999.0,
+                    "freshness_rejection_reason": freshness.freshness_rejection_reason or "",
+                }
+            )
             signals = await self.signal_engine.evaluate(venue, symbol, feature_map, self.state, peer_features, external)
             if freshness.quorum_met and (freshness.own_age_seconds or 0.0) <= float(self.settings.config["vetoes"]["exchange_instability"].get("max_feed_lag_seconds", 2)):
                 self.stats.healthy_snapshot_evaluations += 1
@@ -361,10 +372,14 @@ class TradingApplication:
                 phase = overall_status if venue_payload else "starting"
                 current_queue_depth = self.queue.qsize() if self.queue is not None else 0
                 event_loop_lag_samples = list(self.stats.event_loop_lag_ms)
+                network_status = self.latency.network_status()
+                if network_status["state"] == "degraded":
+                    overall_status = "degraded"
                 self.http_server.status = {
-                    "status": "degraded" if phase == "degraded" else "ok",
+                    "status": "degraded" if phase == "degraded" or network_status["state"] == "degraded" else "ok",
                     "phase": phase,
                     "venues": venue_payload,
+                    "network": network_status,
                     "task_count": len(asyncio.all_tasks()),
                     "socket_count": self.manager.socket_count,
                     "queue_depth": current_queue_depth,
@@ -407,6 +422,7 @@ class TradingApplication:
             "reconnect_count_by_venue": latency_snapshot.get("reconnect_count_by_venue", {}),
             "reconnect_reason_distribution": latency_snapshot.get("reconnect_reason_distribution", {}),
             "recent_reconnects": latency_snapshot.get("recent_reconnects", []),
+            "network": latency_snapshot.get("network", {}),
             "stale_snapshot_blocks": self.stats.stale_snapshot_blocks,
             "healthy_snapshot_evaluations": self.stats.healthy_snapshot_evaluations,
             "signals_evaluated": self.stats.signals_evaluated,
@@ -428,4 +444,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

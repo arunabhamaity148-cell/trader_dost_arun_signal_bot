@@ -891,3 +891,24 @@ curl http://localhost:8080/metrics | head -5
 ---
 
 **শুভকামনা! 🚀** এই বট একটি শক্তিশালী tool, কিন্তু সফলতা নির্ভর করে আপনার নিজের ডিসিপ্লিন ও রিস্ক ম্যানেজমেন্টের উপর। ট্রেড করার আগে পুরো গাইডটি আরেকবার পড়ুন।
+
+---
+
+## Repair / Verification Update (2026-07-27)
+
+This checkpoint was repaired and re-verified in the sandbox with the following infrastructure improvements:
+- core market freshness separated from optional enrichment freshness
+- systemic network/DNS degradation detection and slower degraded-mode reconnects
+- bounded REST concurrency, retry budgets, pacing, and circuit-breaker cooldowns
+- idempotent shutdown and stop-aware background pollers
+- single-line secret-sanitized logging with traceback redaction
+- NewsGuard source cooldown/backoff and per-source isolation
+
+Verification summary for this packaged checkpoint:
+- Full pytest suite: **81 passed / 0 failed**
+- Additional resilience regressions: included in the 81-pass total
+- Live smoke test: **PASS** (short public-market-data run)
+- 15-minute full-watchlist soak: **NOT RUN** in this sandbox
+
+Because the full 15-minute soak was not completed here, treat this package as:
+**REPAIRED — PARTIALLY VERIFIED**

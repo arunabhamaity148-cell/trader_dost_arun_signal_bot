@@ -83,6 +83,7 @@ class NewsGuard:
         if self._task is not None:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
+            self._task = None
         if self._own_client:
             await self.http.aclose()
 
@@ -95,8 +96,10 @@ class NewsGuard:
                 raise
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("news guard refresh failed: %s", exc)
-            await asyncio.sleep(interval)
-
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
 
     async def _normalize_source_item(self, source, item) -> NewsEvent:
         text = f"{item.title} {item.summary}".strip()
@@ -124,7 +127,14 @@ class NewsGuard:
         return "".join(part[0] for part in payload[0] if part and part[0])
 
     async def refresh_once(self) -> None:
-        calendar_events = await self.calendar.upcoming_events() if self.config.get("fred_api_key") else []
+        if self.config.get("fred_api_key"):
+            try:
+                calendar_events = await self.calendar.upcoming_events()
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("macro calendar failed: %s", type(exc).__name__)
+                calendar_events = []
+        else:
+            calendar_events = []
         for macro_event in calendar_events:
             event = NewsEvent(
                 event_id=f"macro-{macro_event.release_id}-{macro_event.release_date.isoformat()}",
@@ -150,7 +160,11 @@ class NewsGuard:
                 LOGGER.warning("news source %s failed: %s", getattr(source, "name", "unknown"), exc)
                 continue
             for item in items:
-                event = await self._normalize_source_item(source, item)
+                try:
+                    event = await self._normalize_source_item(source, item)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("news source %s item normalization failed: %s", getattr(source, "name", "unknown"), type(exc).__name__)
+                    continue
                 self._merge_event(event)
         for event in self.events.values():
             self._advance_lifecycle(event)
@@ -231,7 +245,7 @@ class NewsGuard:
                 continue
             if event.observed_impact.measured_at and now - event.observed_impact.measured_at < timedelta(minutes=5):
                 continue
-            matching_views = [view for venue, view in state.peer_views(symbol).items() if view.closes]
+            matching_views = [view for _venue, view in state.peer_views(symbol).items() if view.closes]
             if not matching_views:
                 continue
             view = matching_views[0]

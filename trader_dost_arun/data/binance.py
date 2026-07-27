@@ -31,7 +31,7 @@ class BinanceConnector(BasePublicConnector):
                 raise
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning("binance OI poll failed: %s", exc)
-            await asyncio.sleep(interval)
+            await self._sleep_or_stop(interval)
 
     def _parse_open_interest_payload(self, payload: dict) -> float | None:
         value = payload.get("openInterest")

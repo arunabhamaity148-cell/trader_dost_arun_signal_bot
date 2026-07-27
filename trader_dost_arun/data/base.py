@@ -6,9 +6,10 @@ import hashlib
 import json
 import logging
 import random
+import socket
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -26,7 +27,11 @@ LOGGER = logging.getLogger(__name__)
 class SharedHttpResources:
     client: httpx.AsyncClient
     semaphore: asyncio.Semaphore
+    request_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     refs: int = 0
+    last_request_monotonic: float = 0.0
+    consecutive_failures: int = 0
+    circuit_open_until: float = 0.0
 
 
 class HeartbeatTimeoutError(TimeoutError):
@@ -60,6 +65,28 @@ def should_reset_retry_state(uptime_seconds: float, had_messages: bool, stable_w
     return had_messages and uptime_seconds >= stable_window_seconds
 
 
+def classify_transport_error(exc: BaseException) -> str:
+    if isinstance(exc, socket.gaierror):
+        return "gaierror"
+    if isinstance(exc, httpx.ConnectTimeout):
+        return "ConnectTimeout"
+    if isinstance(exc, httpx.ReadTimeout):
+        return "ReadTimeout"
+    if isinstance(exc, httpx.ConnectError):
+        return "ConnectError"
+    if isinstance(exc, httpx.TimeoutException):
+        return type(exc).__name__ or "TimeoutError"
+    if isinstance(exc, httpx.NetworkError):
+        return type(exc).__name__ or "NetworkError"
+    if isinstance(exc, httpx.TransportError):
+        return type(exc).__name__ or "TransportError"
+    if isinstance(exc, TimeoutError):
+        return "TimeoutError"
+    if isinstance(exc, OSError) and "getaddrinfo failed" in str(exc).lower():
+        return "gaierror"
+    return type(exc).__name__
+
+
 class BasePublicConnector(abc.ABC):
     venue: str
     ws_url: str
@@ -83,6 +110,9 @@ class BasePublicConnector(abc.ABC):
         self._cached_premium: float | None = None
         self._cached_option_atm_iv: float | None = None
         self._cached_option_put_call_skew: float | None = None
+        self._last_core_event_time: datetime | None = None
+        self._last_core_arrival_time: datetime | None = None
+        self._last_ws_message_time: datetime | None = None
         self._ws = None
         self._closed = False
 
@@ -151,18 +181,53 @@ class BasePublicConnector(abc.ABC):
             jitter_ratio=float(self.config.get("http_retry_jitter_ratio", 0.2)),
         )
 
+    async def _wait_for_rest_slot(self) -> None:
+        min_interval = max(0.0, float(self.config.get("http_min_interval_seconds", 0.0)))
+        async with self._http_resources.request_lock:
+            now = time.monotonic()
+            if self._http_resources.circuit_open_until > now:
+                await self._sleep_or_stop(self._http_resources.circuit_open_until - now)
+            now = time.monotonic()
+            wait = max((self._http_resources.last_request_monotonic + min_interval) - now, 0.0)
+            if wait > 0:
+                await self._sleep_or_stop(wait)
+            self._http_resources.last_request_monotonic = time.monotonic()
+
+    def _mark_rest_success(self) -> None:
+        self._http_resources.consecutive_failures = 0
+        self._http_resources.circuit_open_until = 0.0
+
+    def _mark_rest_failure(self, attempt: int) -> float:
+        self._http_resources.consecutive_failures += 1
+        failure_count = self._http_resources.consecutive_failures
+        threshold = max(1, int(self.config.get("http_circuit_breaker_failures", 3)))
+        if failure_count < threshold:
+            return 0.0
+        cooldown = compute_backoff_delay(
+            failure_count,
+            base_delay=float(self.config.get("http_circuit_breaker_base_delay_seconds", 5.0)),
+            max_delay=float(self.config.get("http_circuit_breaker_max_delay_seconds", 60.0)),
+            jitter_ratio=float(self.config.get("http_retry_jitter_ratio", 0.2)),
+        )
+        self._http_resources.circuit_open_until = max(self._http_resources.circuit_open_until, time.monotonic() + cooldown)
+        return cooldown
+
     async def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
         max_attempts = max(1, int(self.config.get("http_max_attempts", 3)))
         url = f"{self.rest_url}{path}"
         for attempt in range(1, max_attempts + 1):
             try:
+                await self._wait_for_rest_slot()
                 async with self._rest_semaphore:
                     response = await self._rest_client.request(method, url, **kwargs)
                 if response.status_code < 400:
+                    self._mark_rest_success()
                     return response.json()
                 if response.status_code in {401, 403, 404}:
                     response.raise_for_status()
                 delay = self._retry_after_delay(response, attempt)
+                circuit_delay = self._mark_rest_failure(attempt)
+                delay = max(delay, circuit_delay)
                 if attempt >= max_attempts:
                     response.raise_for_status()
                 self.logger.warning(
@@ -179,7 +244,10 @@ class BasePublicConnector(abc.ABC):
                 raise
             except httpx.HTTPStatusError:
                 raise
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.TransportError) as exc:
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.TransportError, TimeoutError, OSError) as exc:
+                error_type = classify_transport_error(exc)
+                circuit_delay = self._mark_rest_failure(attempt)
+                systemic = self.latency_monitor.record_transport_failure(self.venue, self.symbol, error_type)
                 if attempt >= max_attempts:
                     raise
                 delay = compute_backoff_delay(
@@ -188,14 +256,18 @@ class BasePublicConnector(abc.ABC):
                     max_delay=float(self.config.get("http_retry_max_delay_seconds", 30.0)),
                     jitter_ratio=float(self.config.get("http_retry_jitter_ratio", 0.2)),
                 )
+                if systemic:
+                    delay = max(delay, float(self.config.get("network_degraded_rest_backoff_seconds", 5.0)))
+                delay = max(delay, circuit_delay)
                 self.logger.warning(
-                    "rest transient error venue=%s symbol=%s path=%s attempt=%s backoff=%.2fs error=%s",
+                    "rest transient error venue=%s symbol=%s path=%s attempt=%s backoff=%.2fs error=%s network_degraded=%s",
                     self.venue,
                     self.symbol,
                     path,
                     attempt,
                     delay,
-                    type(exc).__name__,
+                    error_type,
+                    systemic,
                 )
                 await self._sleep_or_stop(delay)
         raise RuntimeError(f"unreachable request state for {method} {path}")
@@ -225,13 +297,22 @@ class BasePublicConnector(abc.ABC):
             self._cached_option_atm_iv = snapshot.option_atm_iv
         if snapshot.option_put_call_skew is not None:
             self._cached_option_put_call_skew = snapshot.option_put_call_skew
+        if snapshot.core_event_time is not None:
+            self._last_core_event_time = snapshot.core_event_time
+        if snapshot.core_arrival_time is not None:
+            self._last_core_arrival_time = snapshot.core_arrival_time
+        if snapshot.update_class == "core":
+            self._last_ws_message_time = snapshot.arrival_time
 
     async def emit_snapshot(self, queue: asyncio.Queue, **kwargs: Any) -> None:
-        snapshot = self.build_snapshot(datetime.now(timezone.utc), [], [], **kwargs)
-        self.latency_monitor.record(self.venue, snapshot.event_time, symbol=self.symbol)
+        snapshot = self.build_snapshot(datetime.now(timezone.utc), [], [], is_core_update=False, **kwargs)
+        if snapshot.core_event_time is not None:
+            self.latency_monitor.record(self.venue, snapshot.core_event_time, symbol=self.symbol)
         await queue.put(snapshot)
 
     async def _sleep_or_stop(self, delay: float) -> None:
+        if delay <= 0:
+            return
         try:
             await asyncio.wait_for(self._stop.wait(), timeout=delay)
         except asyncio.TimeoutError:
@@ -274,9 +355,21 @@ class BasePublicConnector(abc.ABC):
         jitter_ratio = float(self.config.get("reconnect_jitter_ratio", 0.2))
         recv_timeout = float(self.config.get("recv_timeout_seconds", 30.0))
         ping_timeout = float(self.config.get("idle_ping_timeout_seconds", 10.0))
+        degraded_base_backoff = float(self.config.get("network_degraded_base_delay_seconds", 5.0))
+        degraded_max_backoff = float(self.config.get("network_degraded_max_delay_seconds", 120.0))
         await self.stagger_start("ws-connect", max_delay_seconds=float(self.config.get("ws_start_stagger_seconds", 2.0)))
         try:
             while not self._stop.is_set():
+                if self.latency_monitor.is_network_degraded():
+                    degraded_delay = compute_backoff_delay(
+                        max(attempt, 1),
+                        base_delay=degraded_base_backoff,
+                        max_delay=degraded_max_backoff,
+                        jitter_ratio=jitter_ratio,
+                    )
+                    await self._sleep_or_stop(degraded_delay)
+                    if self._stop.is_set():
+                        break
                 connection_id = uuid.uuid4().hex[:12]
                 connected_at = time.monotonic()
                 last_message_at: float | None = None
@@ -284,7 +377,9 @@ class BasePublicConnector(abc.ABC):
                 try:
                     async with websockets.connect(self.ws_url, ping_interval=15, ping_timeout=15, max_size=2**24) as websocket:
                         self._ws = websocket
-                        self.latency_monitor.connection_open(self.venue, self.symbol, connection_id)
+                        is_owner = self.latency_monitor.connection_open(self.venue, self.symbol, connection_id)
+                        if not is_owner:
+                            self.logger.warning("duplicate connection ownership venue=%s symbol=%s connection_id=%s", self.venue, self.symbol, connection_id)
                         for message in self.subscription_messages():
                             await websocket.send(json.dumps(message))
                         self.logger.info("connected venue=%s symbol=%s connection_id=%s", self.venue, self.symbol, connection_id)
@@ -299,20 +394,32 @@ class BasePublicConnector(abc.ABC):
                             for item in parsed:
                                 if isinstance(item, MarketSnapshot):
                                     self._update_cache_from_snapshot(item)
-                                self.latency_monitor.record(self.venue, getattr(item, "event_time", datetime.now(timezone.utc)), symbol=self.symbol)
+                                    event_reference = item.core_event_time or item.event_time
+                                else:
+                                    event_reference = getattr(item, "event_time", datetime.now(timezone.utc))
+                                self.latency_monitor.record(self.venue, event_reference, symbol=self.symbol)
                                 await queue.put(item)
                     reason = "socket_closed"
                 except asyncio.CancelledError:
                     raise
                 except HeartbeatTimeoutError:
                     reason = "heartbeat_timeout"
+                    self.latency_monitor.error(self.venue, self.symbol)
                 except ConnectionClosed as exc:
                     reason = f"connection_closed:{exc.code}"
                 except Exception as exc:  # noqa: BLE001
-                    reason = type(exc).__name__
-                    self.latency_monitor.error(self.venue, self.symbol)
-                    self.logger.warning("connector error venue=%s symbol=%s connection_id=%s error=%s", self.venue, self.symbol, connection_id, type(exc).__name__)
+                    reason = classify_transport_error(exc)
+                    systemic = self.latency_monitor.record_transport_failure(self.venue, self.symbol, reason)
+                    self.logger.warning(
+                        "connector error venue=%s symbol=%s connection_id=%s error=%s network_degraded=%s",
+                        self.venue,
+                        self.symbol,
+                        connection_id,
+                        reason,
+                        systemic,
+                    )
                 finally:
+                    self.latency_monitor.connection_closed(self.venue, self.symbol, connection_id)
                     self._ws = None
                 if self._stop.is_set():
                     break
@@ -325,9 +432,19 @@ class BasePublicConnector(abc.ABC):
                 else:
                     attempt += 1
                 backoff = compute_backoff_delay(attempt, base_delay=base_backoff, max_delay=max_backoff, jitter_ratio=jitter_ratio)
+                if self.latency_monitor.is_network_degraded():
+                    backoff = max(
+                        backoff,
+                        compute_backoff_delay(
+                            attempt,
+                            base_delay=degraded_base_backoff,
+                            max_delay=degraded_max_backoff,
+                            jitter_ratio=jitter_ratio,
+                        ),
+                    )
                 self.latency_monitor.reconnect(self.venue, self.symbol, connection_id, reason, uptime, last_message_age, attempt, backoff)
                 self.logger.warning(
-                    "reconnect venue=%s symbol=%s connection_id=%s reason=%s uptime=%.2fs last_message_age=%s attempt=%s backoff=%.2fs",
+                    "reconnect venue=%s symbol=%s connection_id=%s reason=%s uptime=%.2fs last_message_age=%s attempt=%s backoff=%.2fs network_state=%s",
                     self.venue,
                     self.symbol,
                     connection_id,
@@ -336,6 +453,7 @@ class BasePublicConnector(abc.ABC):
                     f"{last_message_age:.2f}s" if last_message_age is not None else "none",
                     attempt,
                     backoff,
+                    self.latency_monitor.network_status()["state"],
                 )
                 await self._sleep_or_stop(backoff)
         finally:
@@ -372,6 +490,7 @@ class BasePublicConnector(abc.ABC):
         premium: float | None = None,
         option_atm_iv: float | None = None,
         option_put_call_skew: float | None = None,
+        is_core_update: bool = True,
     ) -> MarketSnapshot:
         bid_levels = [OrderBookLevel(price=price, size=size) for price, size in (self._coerce_level(level) for level in bids[:10]) if price or size]
         ask_levels = [OrderBookLevel(price=price, size=size) for price, size in (self._coerce_level(level) for level in asks[:10]) if price or size]
@@ -383,6 +502,11 @@ class BasePublicConnector(abc.ABC):
         merged_premium = premium if premium is not None else self._cached_premium
         if merged_premium is None and merged_mark is not None and merged_index is not None:
             merged_premium = merged_mark - merged_index
+        arrival_time = datetime.now(timezone.utc)
+        core_event_time = event_time if is_core_update else self._last_core_event_time
+        core_arrival_time = arrival_time if is_core_update else self._last_core_arrival_time
+        enrichment_event_time = None if is_core_update else event_time
+        enrichment_arrival_time = None if is_core_update else arrival_time
         snapshot = MarketSnapshot(
             venue=self.venue,
             symbol=self.symbol,
@@ -397,6 +521,12 @@ class BasePublicConnector(abc.ABC):
             spread=spread,
             option_atm_iv=self._merge_cache(option_atm_iv, "_cached_option_atm_iv"),
             option_put_call_skew=self._merge_cache(option_put_call_skew, "_cached_option_put_call_skew"),
+            arrival_time=arrival_time,
+            core_event_time=core_event_time,
+            core_arrival_time=core_arrival_time,
+            enrichment_event_time=enrichment_event_time,
+            enrichment_arrival_time=enrichment_arrival_time,
+            update_class="core" if is_core_update else "enrichment",
         )
         self._update_cache_from_snapshot(snapshot)
         return snapshot

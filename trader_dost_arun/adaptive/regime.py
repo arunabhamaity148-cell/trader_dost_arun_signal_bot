@@ -206,8 +206,9 @@ class HMMRegimeDetector:
             return 0, [1.0]
         if self.model == "fallback":
             return self._fallback_state(matrix[-1])
-        assert GaussianHMM is not None
-        model: GaussianHMM = self.model  # type: ignore[assignment]
+        model = self.model
+        if model is None:
+            return 0, [1.0]
         try:
             probs = model.predict_proba(matrix)[0].tolist()
         except Exception as exc:  # noqa: BLE001

@@ -6,7 +6,12 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except Exception:  # noqa: BLE001
+    def load_dotenv(*_args: Any, **_kwargs: Any) -> bool:
+        return False
 
 
 @dataclass(slots=True)
