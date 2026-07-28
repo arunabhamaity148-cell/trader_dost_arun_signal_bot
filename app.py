@@ -20,7 +20,7 @@ from trader_dost_arun.newsguard.guard import NewsGuard
 from trader_dost_arun.ops.alerts import TelegramAlerter
 from trader_dost_arun.ops.health import LATENCY_HIST, SIGNAL_COUNTER, VETO_COUNTER, HealthScorer, OpsHttpServer
 from trader_dost_arun.ops.latency import LatencyMonitor
-from trader_dost_arun.ops.logging_utils import CooldownDeduper, configure_logging
+from trader_dost_arun.ops.logging_utils import CooldownDeduper, configure_logging, get_logging_queue_snapshot
 from trader_dost_arun.ops.telegram_bot import TelegramAdminBot
 from trader_dost_arun.signals.engine import SignalEngine
 
@@ -40,6 +40,17 @@ def _percentile(values: list[float], percentile: float) -> float:
     return ordered[low] * (1 - weight) + ordered[high] * weight
 
 
+def _current_rss_mb() -> float:
+    try:
+        with open('/proc/self/status', 'r', encoding='utf-8') as handle:
+            for line in handle:
+                if line.startswith('VmRSS:'):
+                    return round(float(line.split()[1]) / 1024.0, 2)
+    except Exception:  # noqa: BLE001
+        return 0.0
+    return 0.0
+
+
 @dataclass(slots=True)
 class RuntimeStats:
     started_at_monotonic: float = field(default_factory=monotonic)
@@ -56,6 +67,7 @@ class RuntimeStats:
     queue_high_water_mark: int = 0
     evaluation_latency_ms: deque[float] = field(default_factory=lambda: deque(maxlen=5000))
     event_loop_lag_ms: deque[float] = field(default_factory=lambda: deque(maxlen=5000))
+    rss_mb_samples: deque[float] = field(default_factory=lambda: deque(maxlen=1440))
 
 
 class SignalEvaluationScheduler:
@@ -164,14 +176,20 @@ class TradingApplication:
             max_concurrent=int(self.settings.config["system"].get("signal_evaluation_concurrency", 4)),
         )
         self._suppression_log_deduper = CooldownDeduper(default_cooldown_seconds=float(self.settings.config.get("ops", {}).get("suppression_log_cooldown_seconds", 60)))
+        self._suppression_summary_counts: Counter[str] = Counter()
+        self._suppression_summary_started = monotonic()
+        self._runtime_summary_last = monotonic()
 
     def _apply_runtime_defaults(self) -> None:
         system_cfg = self.settings.config.setdefault("system", {})
         system_cfg.setdefault("signal_evaluation_interval_seconds", 1.0)
         system_cfg.setdefault("signal_evaluation_concurrency", 4)
+        system_cfg.setdefault("market_queue_maxsize", 5000)
         ops_cfg = self.settings.config.setdefault("ops", {})
         ops_cfg.setdefault("health_refresh_seconds", 1.0)
         ops_cfg.setdefault("suppression_log_cooldown_seconds", 60)
+        ops_cfg.setdefault("suppression_summary_window_seconds", 60)
+        ops_cfg.setdefault("runtime_summary_seconds", 60)
         vetoes_cfg = self.settings.config.setdefault("vetoes", {})
         vetoes_cfg.setdefault("freshness_quorum", {"min_sources": 2})
 
@@ -198,6 +216,60 @@ class TradingApplication:
             LOGGER.info("Telegram DISABLED - missing bot token")
         else:
             LOGGER.info("Telegram DISABLED - missing chat id")
+
+    def _record_suppression(self, reason: str, count: int = 1) -> None:
+        if count <= 0:
+            return
+        self._suppression_summary_counts[reason] += count
+
+    def _state_sizes(self) -> dict[str, int]:
+        return {
+            "snapshots": sum(len(queue) for queue in self.state.snapshots.values()),
+            "trades": sum(len(queue) for queue in self.state.trades.values()),
+            "liquidations": sum(len(queue) for queue in self.state.liquidations.values()),
+        }
+
+    def _cache_sizes(self) -> dict[str, int]:
+        cache_method = getattr(self.news_guard, "cache_sizes", None)
+        caches = cache_method() if callable(cache_method) else {}
+        caches["market_state_symbols"] = len(self.state.snapshots)
+        return caches
+
+    def _topology(self) -> dict[str, list[list[str]]]:
+        topology_method = getattr(self.manager, "topology", None)
+        if callable(topology_method):
+            return topology_method()
+        return {venue: [[symbol] for symbol in self.manager.enabled_symbols] for venue in getattr(self.manager, "enabled_venues", [])}
+
+    def _maybe_emit_summary_logs(self) -> None:
+        now = monotonic()
+        suppression_window = float(self.settings.config.get("ops", {}).get("suppression_summary_window_seconds", 60))
+        if self._suppression_summary_counts and now - self._suppression_summary_started >= suppression_window:
+            for reason, total in sorted(self._suppression_summary_counts.items()):
+                LOGGER.info(
+                    "event=signal_suppression_summary window_sec=%s reason=%s total=%s",
+                    int(suppression_window),
+                    reason,
+                    total,
+                )
+            self._suppression_summary_counts.clear()
+            self._suppression_summary_started = now
+        runtime_window = float(self.settings.config.get("ops", {}).get("runtime_summary_seconds", 60))
+        if now - self._runtime_summary_last < runtime_window:
+            return
+        snapshot = self.runtime_snapshot()
+        LOGGER.info(
+            "event=runtime_summary window_sec=%s rss_mb=%.2f queue_depth=%s queue_hwm=%s socket_count=%s task_count=%s reconnects=%s caches=%s",
+            int(runtime_window),
+            snapshot["rss_mb"],
+            snapshot["queue_depth"],
+            snapshot["queue_high_water_mark"],
+            snapshot["socket_count"],
+            snapshot["task_count"],
+            snapshot["reconnect_count_by_venue"],
+            snapshot["cache_sizes"],
+        )
+        self._runtime_summary_last = now
 
     async def run_forever(self) -> None:
         await self.start()
@@ -234,19 +306,23 @@ class TradingApplication:
             item = await self.queue.get()
             self.stats.queue_high_water_mark = max(self.stats.queue_high_water_mark, self.queue.qsize())
             try:
+                should_evaluate = False
                 if isinstance(item, MarketSnapshot):
                     self.state.add_snapshot(item)
                     self.stats.queue_events["snapshot"] += 1
                     await self.signal_engine.update_open_positions(item.venue, item.symbol, self.state)
+                    should_evaluate = True
                 elif isinstance(item, Trade):
                     self.state.add_trade(item)
                     self.stats.queue_events["trade"] += 1
                 elif isinstance(item, LiquidationEvent):
                     self.state.add_liquidation(item)
                     self.stats.queue_events["liquidation"] += 1
+                    should_evaluate = True
                 venue = item.venue
                 symbol = item.symbol
-                self._evaluation_scheduler.notify(venue, symbol)
+                if should_evaluate:
+                    self._evaluation_scheduler.notify(venue, symbol)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -297,8 +373,7 @@ class TradingApplication:
                     self.stats.signals_blocked_by_reason[reason] += 1
                     if reason == "stale_snapshot":
                         self.stats.stale_snapshot_blocks += 1
-                    if self._suppression_log_deduper.should_emit(f"{signal.symbol}:{signal.strategy_name}:{reason}"):
-                        LOGGER.info("signal suppressed %s %s %s", signal.symbol, signal.strategy_name, reason)
+                    self._record_suppression(reason)
                     continue
                 if SIGNAL_COUNTER is not None:
                     SIGNAL_COUNTER.inc()
@@ -318,8 +393,7 @@ class TradingApplication:
                     self.stats.stale_snapshot_blocks += count
                 if VETO_COUNTER is not None:
                     VETO_COUNTER.labels(reason=reason).inc(count)
-                if self._suppression_log_deduper.should_emit(f"{venue}:{symbol}:{reason}"):
-                    LOGGER.info("signal suppressed %s %s %s", symbol, venue, reason)
+                self._record_suppression(reason, count=count)
             elapsed_seconds = perf_counter() - started
             self.stats.evaluation_latency_ms.append(elapsed_seconds * 1000)
             if LATENCY_HIST is not None:
@@ -373,6 +447,11 @@ class TradingApplication:
                 current_queue_depth = self.queue.qsize() if self.queue is not None else 0
                 event_loop_lag_samples = list(self.stats.event_loop_lag_ms)
                 network_status = self.latency.network_status()
+                rss_mb = _current_rss_mb()
+                self.stats.rss_mb_samples.append(rss_mb)
+                logging_queue = get_logging_queue_snapshot()
+                state_sizes = self._state_sizes()
+                cache_sizes = self._cache_sizes()
                 if network_status["state"] == "degraded":
                     overall_status = "degraded"
                 self.http_server.status = {
@@ -384,13 +463,21 @@ class TradingApplication:
                     "socket_count": self.manager.socket_count,
                     "queue_depth": current_queue_depth,
                     "queue_high_water_mark": self.stats.queue_high_water_mark,
+                    "queue_capacity": self.queue.maxsize if self.queue is not None else 0,
                     "event_loop_lag_p95_ms": _percentile(event_loop_lag_samples, 0.95),
                     "event_loop_lag_max_ms": max(event_loop_lag_samples, default=0.0),
+                    "rss_mb": rss_mb,
+                    "rss_peak_mb": max(self.stats.rss_mb_samples, default=rss_mb),
+                    "logging": logging_queue,
+                    "cache_sizes": cache_sizes,
+                    "state_sizes": state_sizes,
+                    "topology": self._topology(),
                 }
                 self.stats.peak_task_count = max(self.stats.peak_task_count, len(asyncio.all_tasks()))
                 latency_snapshot = self.latency.runtime_snapshot()
                 self.stats.reconnect_count_by_venue = Counter(latency_snapshot.get("reconnect_count_by_venue", {}))
                 self.stats.reconnect_reason_distribution = Counter(latency_snapshot.get("reconnect_reason_distribution", {}))
+                self._maybe_emit_summary_logs()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -407,15 +494,21 @@ class TradingApplication:
         event_loop_lag_samples = list(self.stats.event_loop_lag_ms)
         evaluation_latency_samples = list(self.stats.evaluation_latency_ms)
         total_events = sum(self.stats.queue_events.values())
+        logging_queue = get_logging_queue_snapshot()
+        state_sizes = self._state_sizes()
+        cache_sizes = self._cache_sizes()
+        rss_mb = _current_rss_mb()
         return {
             "runtime_duration_seconds": duration,
             "enabled_venues": self.manager.enabled_venues,
             "enabled_symbols": self.manager.enabled_symbols,
+            "topology": self._topology(),
             "socket_count": self.manager.socket_count,
             "task_count": len(asyncio.all_tasks()),
             "peak_task_count": self.stats.peak_task_count,
             "queue_events": dict(self.stats.queue_events),
             "queue_depth": self.queue.qsize() if self.queue is not None else 0,
+            "queue_capacity": self.queue.maxsize if self.queue is not None else 0,
             "queue_high_water_mark": self.stats.queue_high_water_mark,
             "events_processed": total_events,
             "events_processed_per_second": total_events / duration if duration else 0.0,
@@ -433,6 +526,11 @@ class TradingApplication:
             "event_loop_lag_max_ms": max(event_loop_lag_samples, default=0.0),
             "signals_blocked_by_reason": dict(self.stats.signals_blocked_by_reason),
             "unexpected_exceptions": list(self.stats.unexpected_exceptions),
+            "logging": logging_queue,
+            "state_sizes": state_sizes,
+            "cache_sizes": cache_sizes,
+            "rss_mb": rss_mb,
+            "rss_peak_mb": max(self.stats.rss_mb_samples, default=rss_mb),
             "health": self.http_server.status,
         }
 

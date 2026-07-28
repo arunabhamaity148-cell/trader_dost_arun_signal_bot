@@ -22,6 +22,9 @@ TELEGRAM_CHAT_ID_PATTERN = re.compile(r"((?:chat_id|admin_chat_id)['\"]?\s*[:=]\
 
 _LOG_QUEUE: queue.Queue[logging.LogRecord] | None = None
 _QUEUE_LISTENER: QueueListener | None = None
+_DROPPED_LOG_RECORDS = 0
+_DROP_LOCK = threading.Lock()
+_DEFAULT_QUEUE_MAXSIZE = 10000
 
 
 def redact_secrets(value: object) -> str:
@@ -107,6 +110,34 @@ class CooldownDeduper:
             self._last_seen.clear()
 
 
+class BoundedQueueHandler(QueueHandler):
+    def enqueue(self, record: logging.LogRecord) -> None:
+        global _DROPPED_LOG_RECORDS
+        if self.queue is None:
+            return
+        try:
+            self.queue.put_nowait(record)
+            return
+        except queue.Full:
+            pass
+        with _DROP_LOCK:
+            _DROPPED_LOG_RECORDS += 1
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.queue.put_nowait(record)
+            except queue.Full:
+                return
+
+
+def get_logging_queue_snapshot() -> dict[str, int]:
+    qsize = _LOG_QUEUE.qsize() if _LOG_QUEUE is not None else 0
+    maxsize = _LOG_QUEUE.maxsize if _LOG_QUEUE is not None else 0
+    return {"queue_depth": qsize, "queue_capacity": maxsize, "dropped_records": _DROPPED_LOG_RECORDS}
+
+
 def _stop_listener() -> None:
     global _QUEUE_LISTENER
     if _QUEUE_LISTENER is not None:
@@ -115,7 +146,8 @@ def _stop_listener() -> None:
 
 
 def configure_logging(project_root: Path) -> None:
-    global _LOG_QUEUE, _QUEUE_LISTENER
+    global _LOG_QUEUE, _QUEUE_LISTENER, _DROPPED_LOG_RECORDS
+    _DROPPED_LOG_RECORDS = 0
     log_dir = project_root / "logs"
     log_dir.mkdir(exist_ok=True)
     text_fmt = SanitizingFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -139,8 +171,8 @@ def configure_logging(project_root: Path) -> None:
     json_handler.addFilter(redaction_filter)
 
     _stop_listener()
-    _LOG_QUEUE = queue.SimpleQueue()
-    queue_handler = QueueHandler(_LOG_QUEUE)
+    _LOG_QUEUE = queue.Queue(maxsize=_DEFAULT_QUEUE_MAXSIZE)
+    queue_handler = BoundedQueueHandler(_LOG_QUEUE)
     queue_handler.addFilter(redaction_filter)
     root.addHandler(queue_handler)
     _QUEUE_LISTENER = QueueListener(_LOG_QUEUE, console, text_handler, json_handler, respect_handler_level=True)

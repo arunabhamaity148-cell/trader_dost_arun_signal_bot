@@ -51,6 +51,9 @@ class NewsGuard:
         self.source_scores: dict[str, float] = defaultdict(lambda: 1.0)
         self._task: asyncio.Task | None = None
         self._own_client = external_client is None
+        self._merge_semaphore = asyncio.Semaphore(max(1, int(self.config.get("semantic_max_concurrency", 1))))
+        self._event_merge_lock = asyncio.Lock()
+        self._event_retention_hours = float(self.config.get("event_retention_hours", 24.0))
         self.sources = self._build_sources()
 
     def _build_sources(self) -> list:
@@ -126,6 +129,22 @@ class NewsGuard:
             return text
         return "".join(part[0] for part in payload[0] if part and part[0])
 
+    async def _merge_event_async(self, event: NewsEvent) -> None:
+        async with self._merge_semaphore:
+            async with self._event_merge_lock:
+                await asyncio.to_thread(self._merge_event, event)
+
+    def cache_sizes(self) -> dict[str, int]:
+        return {"events": len(self.events), "embedding_similarity_cache": self.embedder.cache_size()}
+
+    def _prune_expired_events(self) -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=self._event_retention_hours)
+        self.events = {
+            event_id: event
+            for event_id, event in self.events.items()
+            if event.last_seen_at >= cutoff and event.lifecycle != "expired"
+        }
+
     async def refresh_once(self) -> None:
         if self.config.get("fred_api_key"):
             try:
@@ -152,7 +171,7 @@ class NewsGuard:
                 first_seen_at=macro_event.release_time,
                 last_seen_at=macro_event.release_time,
             )
-            self._merge_event(event)
+            await self._merge_event_async(event)
         for source in self.sources:
             try:
                 items = await source.fetch()
@@ -165,9 +184,11 @@ class NewsGuard:
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.warning("news source %s item normalization failed: %s", getattr(source, "name", "unknown"), type(exc).__name__)
                     continue
-                self._merge_event(event)
+                await self._merge_event_async(event)
         for event in self.events.values():
             self._advance_lifecycle(event)
+        self._prune_expired_events()
+        for event in self.events.values():
             self.store.upsert_event(event)
 
     def _merge_event(self, incoming: NewsEvent) -> None:

@@ -2,6 +2,27 @@
 
 > একটি প্রোডাকশন-গ্রেড ক্রিপ্টো ফিউচারস সিগন্যাল বট। ৫টি এক্সচেঞ্জ থেকে লাইভ ডেটা স্ক্যান করে, ১৯টি স্ট্র্যাটেজি চালায়, ২১টি ভিটো ফিল্টার দিয়ে যাচাই করে, HMM রেজিম ডিটেকশন, Bayesian কনফিডেন্স, LightGBM মেটা-লেবেল ML, Kelly সাইজিং, এবং আল্ট্রা-প্রিমিয়াম টেলিগ্রাম মেসেজ দেয়।
 
+## Repair / verification note
+
+This repository was repaired and re-packaged in a later verification session.
+
+Current evidence:
+- grouped websocket topology implemented (default 9 sockets)
+- grouped supplemental enrichment ownership implemented
+- bounded market queue and bounded logging queue implemented
+- SentenceTransformer progress output disabled
+- full pytest green: **88 passed**
+- 60-second full-watchlist live smoke executed
+- 15-minute full-watchlist soak **not verified**
+- current overall classification: **NOT READY** because the live smoke saturated the queue and showed high event-loop lag
+
+See:
+- `ROOT_CAUSE_REPORT.md`
+- `ARCHITECTURE_CHANGES.md`
+- `TEST_RESULTS.md`
+- `RUNTIME_VERIFICATION.md`
+- `SOAK_TEST_RESULTS.md`
+
 ---
 
 ## 📑 সূচিপত্র

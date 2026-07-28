@@ -1,0 +1,334 @@
+{
+  "runtime_duration_seconds": 88.56355351000002,
+  "enabled_venues": [
+    "binance",
+    "bybit",
+    "deribit",
+    "hyperliquid",
+    "okx"
+  ],
+  "enabled_symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "ARBUSDT",
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "ARBUSDT",
+    "BTC-USDT-SWAP",
+    "ETH-USDT-SWAP",
+    "SOL-USDT-SWAP",
+    "BNB-USDT-SWAP",
+    "XRP-USDT-SWAP",
+    "DOGE-USDT-SWAP",
+    "ADA-USDT-SWAP",
+    "AVAX-USDT-SWAP",
+    "LINK-USDT-SWAP",
+    "ARB-USDT-SWAP",
+    "BTC-PERP",
+    "ETH-PERP",
+    "SOL-PERP",
+    "BNB-PERP",
+    "XRP-PERP",
+    "DOGE-PERP",
+    "ADA-PERP",
+    "AVAX-PERP",
+    "LINK-PERP",
+    "ARB-PERP",
+    "BTC-PERPETUAL",
+    "ETH-PERPETUAL"
+  ],
+  "topology": {
+    "binance": [
+      [
+        "BTCUSDT",
+        "ETHUSDT",
+        "SOLUSDT",
+        "BNBUSDT",
+        "XRPUSDT"
+      ],
+      [
+        "DOGEUSDT",
+        "ADAUSDT",
+        "AVAXUSDT",
+        "LINKUSDT",
+        "ARBUSDT"
+      ]
+    ],
+    "bybit": [
+      [
+        "BTCUSDT",
+        "ETHUSDT",
+        "SOLUSDT",
+        "BNBUSDT",
+        "XRPUSDT"
+      ],
+      [
+        "DOGEUSDT",
+        "ADAUSDT",
+        "AVAXUSDT",
+        "LINKUSDT",
+        "ARBUSDT"
+      ]
+    ],
+    "okx": [
+      [
+        "BTC-USDT-SWAP",
+        "ETH-USDT-SWAP",
+        "SOL-USDT-SWAP",
+        "BNB-USDT-SWAP",
+        "XRP-USDT-SWAP"
+      ],
+      [
+        "DOGE-USDT-SWAP",
+        "ADA-USDT-SWAP",
+        "AVAX-USDT-SWAP",
+        "LINK-USDT-SWAP",
+        "ARB-USDT-SWAP"
+      ]
+    ],
+    "hyperliquid": [
+      [
+        "BTC-PERP",
+        "ETH-PERP",
+        "SOL-PERP",
+        "BNB-PERP",
+        "XRP-PERP"
+      ],
+      [
+        "DOGE-PERP",
+        "ADA-PERP",
+        "AVAX-PERP",
+        "LINK-PERP",
+        "ARB-PERP"
+      ]
+    ],
+    "deribit": [
+      [
+        "BTC-PERPETUAL",
+        "ETH-PERPETUAL"
+      ]
+    ]
+  },
+  "socket_count": 9,
+  "task_count": 71,
+  "peak_task_count": 77,
+  "queue_events": {
+    "snapshot": 31151,
+    "trade": 12468
+  },
+  "queue_depth": 5000,
+  "queue_capacity": 5000,
+  "queue_high_water_mark": 4395,
+  "events_processed": 43619,
+  "events_processed_per_second": 492.5163712528182,
+  "reconnect_count_by_venue": {},
+  "reconnect_reason_distribution": {},
+  "recent_reconnects": [],
+  "network": {
+    "state": "healthy",
+    "since": null,
+    "reason": null,
+    "recent_failure_count": 2,
+    "recent_failure_venues": [
+      "hyperliquid"
+    ]
+  },
+  "stale_snapshot_blocks": 87,
+  "healthy_snapshot_evaluations": 542,
+  "signals_evaluated": 599,
+  "signals_emitted": 0,
+  "evaluation_latency_p95_ms": 1910.2587474000984,
+  "evaluation_latency_max_ms": 16027.932024000052,
+  "event_loop_lag_p95_ms": 4072.4995745000238,
+  "event_loop_lag_max_ms": 18497.97159400009,
+  "signals_blocked_by_reason": {
+    "exchange_instability": 224,
+    "cross_venue_dispersion": 118,
+    "wrong_leverage_regime": 199,
+    "spread_depth_deterioration": 230,
+    "stale_snapshot": 87
+  },
+  "unexpected_exceptions": [],
+  "logging": {
+    "queue_depth": 5,
+    "queue_capacity": 10000,
+    "dropped_records": 0
+  },
+  "state_sizes": {
+    "snapshots": 28716,
+    "trades": 12468,
+    "liquidations": 0
+  },
+  "cache_sizes": {
+    "events": 11,
+    "embedding_similarity_cache": 133,
+    "market_state_symbols": 42
+  },
+  "rss_mb": 252.92,
+  "rss_peak_mb": 252.92,
+  "health": {
+    "status": "degraded",
+    "phase": "degraded",
+    "venues": {
+      "binance": {
+        "score": 74.71102139852347,
+        "status": "healthy",
+        "p95_latency_ms": 24399.258499999996,
+        "stale_seconds": 0.08111,
+        "reconnect_count": 0,
+        "sample_count": 1000
+      },
+      "bybit": {
+        "score": 74.63033539852347,
+        "status": "healthy",
+        "p95_latency_ms": 20802.1761,
+        "stale_seconds": 0.121453,
+        "reconnect_count": 0,
+        "sample_count": 1000
+      },
+      "deribit": {
+        "score": 74.86743339852347,
+        "status": "healthy",
+        "p95_latency_ms": 16866.186100000003,
+        "stale_seconds": 0.002904,
+        "reconnect_count": 0,
+        "sample_count": 722
+      },
+      "hyperliquid": {
+        "score": 70.86885539852348,
+        "status": "degraded",
+        "p95_latency_ms": 419686.72219999984,
+        "stale_seconds": 0.002193,
+        "reconnect_count": 0,
+        "sample_count": 793
+      },
+      "okx": {
+        "score": 74.86597939852348,
+        "status": "healthy",
+        "p95_latency_ms": 29080.132,
+        "stale_seconds": 0.003631,
+        "reconnect_count": 0,
+        "sample_count": 1000
+      }
+    },
+    "network": {
+      "state": "healthy",
+      "since": null,
+      "reason": null,
+      "recent_failure_count": 2,
+      "recent_failure_venues": [
+        "hyperliquid"
+      ]
+    },
+    "task_count": 71,
+    "socket_count": 9,
+    "queue_depth": 5000,
+    "queue_high_water_mark": 4395,
+    "queue_capacity": 5000,
+    "event_loop_lag_p95_ms": 4072.4995745000238,
+    "event_loop_lag_max_ms": 18497.97159400009,
+    "rss_mb": 252.92,
+    "rss_peak_mb": 252.92,
+    "logging": {
+      "queue_depth": 0,
+      "queue_capacity": 10000,
+      "dropped_records": 0
+    },
+    "cache_sizes": {
+      "events": 11,
+      "embedding_similarity_cache": 133,
+      "market_state_symbols": 42
+    },
+    "state_sizes": {
+      "snapshots": 28716,
+      "trades": 12468,
+      "liquidations": 0
+    },
+    "topology": {
+      "binance": [
+        [
+          "BTCUSDT",
+          "ETHUSDT",
+          "SOLUSDT",
+          "BNBUSDT",
+          "XRPUSDT"
+        ],
+        [
+          "DOGEUSDT",
+          "ADAUSDT",
+          "AVAXUSDT",
+          "LINKUSDT",
+          "ARBUSDT"
+        ]
+      ],
+      "bybit": [
+        [
+          "BTCUSDT",
+          "ETHUSDT",
+          "SOLUSDT",
+          "BNBUSDT",
+          "XRPUSDT"
+        ],
+        [
+          "DOGEUSDT",
+          "ADAUSDT",
+          "AVAXUSDT",
+          "LINKUSDT",
+          "ARBUSDT"
+        ]
+      ],
+      "okx": [
+        [
+          "BTC-USDT-SWAP",
+          "ETH-USDT-SWAP",
+          "SOL-USDT-SWAP",
+          "BNB-USDT-SWAP",
+          "XRP-USDT-SWAP"
+        ],
+        [
+          "DOGE-USDT-SWAP",
+          "ADA-USDT-SWAP",
+          "AVAX-USDT-SWAP",
+          "LINK-USDT-SWAP",
+          "ARB-USDT-SWAP"
+        ]
+      ],
+      "hyperliquid": [
+        [
+          "BTC-PERP",
+          "ETH-PERP",
+          "SOL-PERP",
+          "BNB-PERP",
+          "XRP-PERP"
+        ],
+        [
+          "DOGE-PERP",
+          "ADA-PERP",
+          "AVAX-PERP",
+          "LINK-PERP",
+          "ARB-PERP"
+        ]
+      ],
+      "deribit": [
+        [
+          "BTC-PERPETUAL",
+          "ETH-PERPETUAL"
+        ]
+      ]
+    }
+  }
+}

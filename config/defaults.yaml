@@ -2,7 +2,8 @@ system:
   history_size: 3000
   min_snapshots_before_signals: 30
   signal_evaluation_interval_seconds: 1.0
-  signal_evaluation_concurrency: 4
+  signal_evaluation_concurrency: 8
+  market_queue_maxsize: 5000
 watchlist:
   binance: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "ARBUSDT"]
   bybit: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "ARBUSDT"]
@@ -17,12 +18,14 @@ connectors:
     reconnect_jitter_ratio: 0.2
     stable_connection_reset_seconds: 20
     recv_timeout_seconds: 30
+    max_symbols_per_connection: 5
   bybit:
     reconnect_base_delay_seconds: 1.0
     reconnect_max_delay_seconds: 30.0
     reconnect_jitter_ratio: 0.2
     stable_connection_reset_seconds: 20
     recv_timeout_seconds: 30
+    max_symbols_per_connection: 5
   okx:
     open_interest_poll_seconds: 15
     reconnect_base_delay_seconds: 1.0
@@ -30,6 +33,7 @@ connectors:
     reconnect_jitter_ratio: 0.2
     stable_connection_reset_seconds: 20
     recv_timeout_seconds: 30
+    max_symbols_per_connection: 5
   hyperliquid:
     open_interest_poll_seconds: 15
     reconnect_base_delay_seconds: 1.0
@@ -37,6 +41,7 @@ connectors:
     reconnect_jitter_ratio: 0.2
     stable_connection_reset_seconds: 20
     recv_timeout_seconds: 30
+    max_symbols_per_connection: 5
   deribit:
     options_poll_seconds: 30
     reconnect_base_delay_seconds: 1.0
@@ -44,6 +49,7 @@ connectors:
     reconnect_jitter_ratio: 0.2
     stable_connection_reset_seconds: 20
     recv_timeout_seconds: 30
+    max_symbols_per_connection: 20
 external:
   refresh_seconds: 180
 ops:
@@ -51,6 +57,8 @@ ops:
   health_port: 8080
   health_refresh_seconds: 1.0
   suppression_log_cooldown_seconds: 60
+  suppression_summary_window_seconds: 60
+  runtime_summary_seconds: 60
 risk:
   daily_loss_limit_r: 4
   kill_switch_after_consecutive_losses: 4
