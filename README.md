@@ -4,17 +4,20 @@
 
 ## Repair / verification note
 
-This repository was repaired and re-packaged in a later verification session.
+This repository was repaired, re-tested, and re-packaged in a later production-hardening session.
 
 Current evidence:
-- grouped websocket topology implemented (default 9 sockets)
-- grouped supplemental enrichment ownership implemented
-- bounded market queue and bounded logging queue implemented
-- SentenceTransformer progress output disabled
-- full pytest green: **88 passed**
-- 60-second full-watchlist live smoke executed
-- 15-minute full-watchlist soak **not verified**
-- current overall classification: **NOT READY** because the live smoke saturated the queue and showed high event-loop lag
+- grouped websocket topology verified live at **9 sockets** on the default watchlist
+- bounded market-ingress coalescing added to prevent websocket starvation on obsolete snapshots
+- explicit heartbeat ownership retained in-app while websocket library auto-pings were disabled to avoid overlapping keepalive ownership
+- abnormal disconnects now participate in systemic network degradation detection
+- external-context bootstrap/failure handling hardened and Telegram disabled-state logging deduplicated
+- RSS telemetry fixed for Linux and Windows-compatible code paths
+- full pytest green: **95 passed**
+- clean install in a fresh virtualenv: **PASS**
+- 60-second full-watchlist smoke: **PASS** (stable, no reconnect storm)
+- 15-minute full-watchlist soak: **FAIL acceptance** due one heartbeat timeout, degraded final health, elevated stale suppressions / loop lag, and continued RSS growth
+- current overall classification: **REPAIRED — PARTIALLY VERIFIED**
 
 See:
 - `ROOT_CAUSE_REPORT.md`
@@ -22,6 +25,7 @@ See:
 - `TEST_RESULTS.md`
 - `RUNTIME_VERIFICATION.md`
 - `SOAK_TEST_RESULTS.md`
+- `FAULT_INJECTION_RESULTS.md`
 
 ---
 
@@ -65,7 +69,7 @@ See:
 | Observability | Prometheus /metrics + /health + structured JSON logs |
 | Risk Engine | Kill switch + daily loss limit + cooldown + RR validation |
 | Telegram UX | Ultra-premium template + admin bot (/mute /status /stats) |
-| টেস্ট কভারেজ | 48 tests (0 failures) |
+| টেস্ট কভারেজ | 95 tests (0 failures) |
 
 > ⚠️ এটি শুধু সিগন্যাল বট — নিজে কোনো ট্রেড করে না। সিগন্যাল পেলে আপনি নিজে ম্যানুয়ালি ট্রেড নেবেন।
 

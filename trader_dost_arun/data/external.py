@@ -4,14 +4,15 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Awaitable, Callable, TypeVar
 
 import httpx
 
 from trader_dost_arun.newsguard.calendar import EconomicCalendarClient, EconomicCalendarEvent
 
 LOGGER = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 @dataclass(slots=True)
@@ -32,11 +33,16 @@ class ExternalDataClient:
         self._context = ExternalContext()
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        self._consecutive_failures = 0
+        self._cooldown_until: datetime | None = None
 
     async def start(self) -> None:
         if self._task is None:
             self._task = asyncio.create_task(self._refresh_loop(), name="external-context-refresh")
-            await self.refresh_once()
+            try:
+                await self.refresh_once()
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("external context bootstrap degraded: error_type=%s", type(exc).__name__)
 
     async def close(self) -> None:
         if self._task is not None:
@@ -67,13 +73,36 @@ class ExternalDataClient:
         now = datetime.now(timezone.utc)
         return [now] if "crypto" in text else []
 
+    async def _safe_component_call(
+        self,
+        name: str,
+        func: Callable[..., Awaitable[T]],
+        *args: Any,
+        fallback: T,
+        **kwargs: Any,
+    ) -> T:
+        try:
+            return await func(*args, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("external context component failed: component=%s error_type=%s", name, type(exc).__name__)
+            return fallback
+
     async def refresh_once(self) -> ExternalContext:
         async with self._lock:
-            prices = await self.coingecko_prices(["bitcoin", "ethereum", "tether", "usd-coin"])
-            stable = await self.defillama_stablecoins()
-            macro_events = await self.calendar.upcoming_events()
-            sec_events = await self.sec_feed_recent()
             now = datetime.now(timezone.utc)
+            if self._cooldown_until is not None and now < self._cooldown_until:
+                return self._context
+            prices = await self._safe_component_call(
+                "coingecko_prices",
+                self.coingecko_prices,
+                ["bitcoin", "ethereum", "tether", "usd-coin"],
+                fallback={},
+            )
+            stable = await self._safe_component_call("defillama_stablecoins", self.defillama_stablecoins, fallback={})
+            macro_events = await self._safe_component_call("economic_calendar", self.calendar.upcoming_events, fallback=[])
+            sec_events = await self._safe_component_call("sec_feed_recent", self.sec_feed_recent, fallback=[])
             macro_blocked = any(abs((event.release_time - now).total_seconds()) <= 20 * 60 for event in macro_events)
             sec_blocked = any(abs((event - now).total_seconds()) <= 20 * 60 for event in sec_events)
             tether_price = prices.get("tether", {}).get("usd", 1.0)
@@ -96,6 +125,13 @@ class ExternalDataClient:
                 stablecoin_metrics=metrics,
                 macro_events=macro_events,
             )
+            if prices or stable or macro_events or sec_events:
+                self._consecutive_failures = 0
+                self._cooldown_until = None
+            else:
+                self._consecutive_failures += 1
+                backoff = min(max(self.refresh_seconds, 5), 300) * min(self._consecutive_failures, 4)
+                self._cooldown_until = now + timedelta(seconds=backoff)
             return self._context
 
     async def _refresh_loop(self) -> None:
@@ -105,5 +141,8 @@ class ExternalDataClient:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                LOGGER.warning("external context refresh failed: %s", exc)
+                self._consecutive_failures += 1
+                backoff = min(max(self.refresh_seconds, 5), 300) * min(self._consecutive_failures, 4)
+                self._cooldown_until = datetime.now(timezone.utc) + timedelta(seconds=backoff)
+                LOGGER.warning("external context refresh failed: error_type=%s cooldown_seconds=%s", type(exc).__name__, int(backoff))
             await asyncio.sleep(self.refresh_seconds)

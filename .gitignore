@@ -32,3 +32,17 @@ data/backtest_reports/
 Thumbs.db
 .vscode/
 .idea/
+
+# Local secrets/runtime
+.env
+.env.*
+!.env.example
+*.sqlite3
+*.db
+*.log
+*.out
+logs/
+__pycache__/
+.pytest_cache/
+.venv/
+venv/

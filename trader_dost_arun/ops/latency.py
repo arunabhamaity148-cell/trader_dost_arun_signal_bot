@@ -16,6 +16,7 @@ SYSTEMIC_ERROR_NAMES = {
     "NetworkError",
     "TransportError",
     "gaierror",
+    "heartbeat_timeout",
 }
 
 
@@ -149,7 +150,7 @@ class LatencyMonitor:
 
     def record_transport_failure(self, venue: str, symbol: str, error_type: str) -> bool:
         self.errors[venue] += 1
-        if error_type not in SYSTEMIC_ERROR_NAMES:
+        if error_type not in SYSTEMIC_ERROR_NAMES and not error_type.startswith("connection_closed:10"):
             return False
         now = self._utcnow()
         self.network_recoveries = 0

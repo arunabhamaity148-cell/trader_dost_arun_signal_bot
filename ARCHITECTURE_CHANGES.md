@@ -1,67 +1,86 @@
 # ARCHITECTURE CHANGES
 
-## 1. Connector ownership model
+## 1) Bounded grouped websocket topology retained and verified
+The repository keeps the grouped/multiplexed connector design and does **not** revert to one websocket per venue × symbol.
 
-### Before
-- `ConnectorManager` created one websocket task per `venue:symbol`.
-- Default watchlist expanded to ~42 websocket tasks.
-- Supplemental REST enrichment ownership also lived per symbol.
+Verified default topology on the live default watchlist:
+- Binance: **2** grouped sockets
+- Bybit: **2** grouped sockets
+- OKX: **2** grouped sockets
+- Hyperliquid: **2** grouped sockets
+- Deribit: **1** grouped socket
+- Total: **9 sockets**
 
-### After
-- `ConnectorManager` now groups symbols per venue and starts one grouped connector task per bounded symbol batch.
-- Default topology:
-  - Binance: 2 grouped connectors (5 symbols each)
-  - Bybit: 2 grouped connectors (5 symbols each)
-  - OKX: 2 grouped connectors (5 symbols each)
-  - Hyperliquid: 2 grouped connectors (5 symbols each)
-  - Deribit: 1 grouped connector (2 symbols)
-- Effective default websocket count: **9**.
+## 2) Market ingress changed from blocking FIFO to bounded latest-state semantics
+`ConnectorManager` now owns a dedicated bounded market-ingress queue implementation instead of a plain `asyncio.Queue`.
 
-## 2. New grouped connector layer
-Added `trader_dost_arun/data/grouped.py` containing grouped venue connectors:
-- `BinanceGroupedConnector`
-- `BybitGroupedConnector`
-- `OkxGroupedConnector`
-- `HyperliquidGroupedConnector`
-- `DeribitGroupedConnector`
+### New behavior
+- snapshots are coalesced by `venue:symbol`
+- the newest snapshot supersedes older pending snapshots for the same feed
+- trade / liquidation flow remains bounded
+- overload is observable through runtime counters
+- connectors no longer need to block on stale snapshot buildup before the consumer catches up
 
-Each grouped connector provides:
-- bounded symbol ownership
-- per-symbol cache/state inside a shared connection owner
-- grouped subscriptions
-- grouped supplemental polling ownership
-- per-symbol routing from shared payload streams
-- stop-aware reconnect behavior inherited from the base connector logic
+### New runtime counters
+`runtime_snapshot()` and `/health` now include `queue_overload`, exposing:
+- `coalesced_snapshots`
+- `dropped_snapshots`
+- `dropped_trades`
+- `dropped_liquidations`
+- `dropped_total`
+- snapshot/critical depths and capacities
 
-## 3. Supplemental polling changes
-- Binance: grouped open-interest polling loop iterates symbols under one connector owner.
-- OKX: grouped open-interest polling loop iterates symbols under one connector owner.
-- Hyperliquid: one grouped `metaAndAssetCtxs` poll fans out to all symbols in the connector.
-- Deribit: grouped option-metrics polling fans out by currency-owned connector group.
+## 3) Explicit heartbeat ownership
+Connector sockets now disable websocket-library auto-pings and use the application-owned recv-timeout / ping-probe path as the sole liveness owner.
 
-## 4. Runtime observability additions
-`TradingApplication.runtime_snapshot()` now exposes:
-- grouped topology
-- queue capacity / depth / HWM
-- logging queue status
-- RSS / RSS peak
-- cache sizes
-- state sizes
+Why this matters:
+- reduces split ownership between library keepalive and app keepalive
+- makes timeout reasoning deterministic
+- avoids overlapping ping strategies across grouped feeds
 
-`/health` now carries the same operational signals.
+## 4) Systemic disconnect classification widened
+Abnormal close reasons and heartbeat timeouts now participate in the same network-degraded coordination path as transport/DNS failures.
 
-## 5. Logging pipeline hardening
-- Replaced unbounded `SimpleQueue` with bounded `queue.Queue(maxsize=10000)`.
-- Added oldest-record drop behavior for queue overflow.
-- Added queue snapshot reporting (`queue_depth`, `queue_capacity`, `dropped_records`).
-- Added suppression-summary aggregation.
+This improves shared-cause handling for:
+- abnormal websocket close waves
+- transient infra / DNS / routing degradation
+- reconnect coordination across venues
 
-## 6. NewsGuard / embedding path hardening
-- SentenceTransformer progress output disabled explicitly.
-- Similarity cache bounded.
-- NewsGuard semantic merge work moved to `asyncio.to_thread(...)`.
-- Added serialization around merge mutation to prevent concurrent dict modification.
-- Added event-retention pruning.
+## 5) External context hardening
+The optional external-context subsystem was changed to:
+- isolate failures per component
+- log concise component-specific diagnostics
+- degrade bootstrap failures instead of aborting startup
+- retain cooldown/backoff state internally
 
-## 7. Current limitation after repair
-The architecture is materially improved and fully unit-tested, but the full default-watchlist live smoke still showed queue saturation and high event-loop lag in this sandbox. The system is therefore repaired but not production-ready from the evidence collected here.
+This keeps optional enrichment from destabilizing core market ingestion.
+
+## 6) Telegram disabled-state deduplication
+Application startup remains the single source of truth for Telegram enabled/disabled status. The admin-bot component now silently no-ops when unconfigured.
+
+## 7) Portable RSS telemetry
+RSS collection now supports:
+- Linux `/proc/self/status`
+- Windows `GetProcessMemoryInfo`
+- `resource.getrusage(...)` fallback where available
+
+## 8) Regression suite additions
+New regression coverage added in this session covers:
+- bounded market-queue coalescing
+- liquidation preservation under pressure
+- systemic classification of `connection_closed:1006`
+- external bootstrap failure isolation
+- reconnect loops not duplicating supplemental workers
+- runtime snapshot exposure of overload counters
+
+## 9) What did *not* change
+The repair deliberately did **not** remove or disable the core trading stack:
+- strategy selection
+- veto framework
+- risk logic
+- TP/SL behavior
+- leverage handling
+- cross-venue freshness / alias logic
+- health / metrics endpoints
+- Telegram formatting
+- backtesting modules

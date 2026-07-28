@@ -16,6 +16,7 @@ from trader_dost_arun.data.grouped import (
     HyperliquidGroupedConnector,
     OkxGroupedConnector,
 )
+from trader_dost_arun.data.ingress import BoundedMarketQueue
 from trader_dost_arun.data.hyperliquid import HyperliquidConnector
 from trader_dost_arun.data.okx import OkxConnector
 from trader_dost_arun.ops.latency import LatencyMonitor
@@ -51,7 +52,8 @@ class ConnectorManager:
         self.config = config
         self.latency_monitor = latency_monitor
         queue_maxsize = max(1, int(self.config.get("system", {}).get("market_queue_maxsize", 5000)))
-        self.queue: asyncio.Queue = asyncio.Queue(maxsize=queue_maxsize)
+        snapshot_ratio = float(self.config.get("system", {}).get("market_queue_snapshot_capacity_ratio", 0.7))
+        self.queue: BoundedMarketQueue = BoundedMarketQueue(maxsize=queue_maxsize, snapshot_capacity_ratio=snapshot_ratio)
         self.tasks: dict[str, asyncio.Task] = {}
         self.connectors: dict[str, BasePublicConnector | GroupedPublicConnector] = {}
         self._topology: dict[str, list[list[str]]] = defaultdict(list)

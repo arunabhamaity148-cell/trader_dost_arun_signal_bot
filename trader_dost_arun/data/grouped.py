@@ -18,6 +18,7 @@ from trader_dost_arun.data.base import (
     HeartbeatTimeoutError,
     classify_transport_error,
     compute_backoff_delay,
+    is_systemic_disconnect,
     parse_ts,
     should_reset_retry_state,
 )
@@ -232,7 +233,7 @@ class GroupedPublicConnector(BasePublicConnector):
                 last_message_at: float | None = None
                 reason = "disconnect"
                 try:
-                    async with websockets.connect(self.ws_url, ping_interval=15, ping_timeout=15, max_size=2**24) as websocket:
+                    async with websockets.connect(self.ws_url, ping_interval=None, ping_timeout=None, close_timeout=5, max_size=2**24, max_queue=32) as websocket:
                         self._ws = websocket
                         is_owner = self.latency_monitor.connection_open(self.venue, self.symbol, connection_id)
                         if not is_owner:
@@ -270,8 +271,12 @@ class GroupedPublicConnector(BasePublicConnector):
                 except HeartbeatTimeoutError:
                     reason = "heartbeat_timeout"
                     self.latency_monitor.error(self.venue, self.symbol)
+                    self.latency_monitor.record_transport_failure(self.venue, self.symbol, reason)
                 except ConnectionClosed as exc:
-                    reason = f"connection_closed:{exc.code}"
+                    close_code = getattr(getattr(exc, "rcvd", None), "code", None) or getattr(websocket, "close_code", None) or 1006
+                    reason = f"connection_closed:{close_code}"
+                    if is_systemic_disconnect(reason):
+                        self.latency_monitor.record_transport_failure(self.venue, self.symbol, reason)
                 except Exception as exc:  # noqa: BLE001
                     reason = classify_transport_error(exc)
                     systemic = self.latency_monitor.record_transport_failure(self.venue, self.symbol, reason)

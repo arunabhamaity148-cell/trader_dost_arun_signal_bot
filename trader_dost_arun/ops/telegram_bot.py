@@ -64,11 +64,7 @@ class TelegramAdminBot:
         return "Unknown command"
 
     async def start(self) -> None:
-        if not self.token:
-            LOGGER.info("Telegram DISABLED - missing bot token")
-            return
-        if not self.admin_chat_id:
-            LOGGER.info("Telegram DISABLED - missing admin chat id")
+        if not self.token or not self.admin_chat_id:
             return
         if self._task is None:
             LOGGER.info("Telegram ENABLED - admin bot polling active")

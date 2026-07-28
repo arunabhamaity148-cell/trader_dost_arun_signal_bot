@@ -65,6 +65,10 @@ def should_reset_retry_state(uptime_seconds: float, had_messages: bool, stable_w
     return had_messages and uptime_seconds >= stable_window_seconds
 
 
+def is_systemic_disconnect(reason: str) -> bool:
+    return reason == "heartbeat_timeout" or reason.startswith("connection_closed:10") or reason in {"socket_closed", "gaierror", "ConnectTimeout", "ReadTimeout", "ConnectError", "NetworkError", "TransportError", "TimeoutError"}
+
+
 def classify_transport_error(exc: BaseException) -> str:
     if isinstance(exc, socket.gaierror):
         return "gaierror"
@@ -375,7 +379,7 @@ class BasePublicConnector(abc.ABC):
                 last_message_at: float | None = None
                 reason = "disconnect"
                 try:
-                    async with websockets.connect(self.ws_url, ping_interval=15, ping_timeout=15, max_size=2**24) as websocket:
+                    async with websockets.connect(self.ws_url, ping_interval=None, ping_timeout=None, close_timeout=5, max_size=2**24, max_queue=32) as websocket:
                         self._ws = websocket
                         is_owner = self.latency_monitor.connection_open(self.venue, self.symbol, connection_id)
                         if not is_owner:
@@ -405,8 +409,12 @@ class BasePublicConnector(abc.ABC):
                 except HeartbeatTimeoutError:
                     reason = "heartbeat_timeout"
                     self.latency_monitor.error(self.venue, self.symbol)
+                    self.latency_monitor.record_transport_failure(self.venue, self.symbol, reason)
                 except ConnectionClosed as exc:
-                    reason = f"connection_closed:{exc.code}"
+                    close_code = getattr(getattr(exc, "rcvd", None), "code", None) or getattr(websocket, "close_code", None) or 1006
+                    reason = f"connection_closed:{close_code}"
+                    if is_systemic_disconnect(reason):
+                        self.latency_monitor.record_transport_failure(self.venue, self.symbol, reason)
                 except Exception as exc:  # noqa: BLE001
                     reason = classify_transport_error(exc)
                     systemic = self.latency_monitor.record_transport_failure(self.venue, self.symbol, reason)

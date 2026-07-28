@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import logging
 import os
+import sys
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import monotonic, perf_counter
 from typing import Any
+
+try:
+    import resource
+except Exception:  # noqa: BLE001
+    resource = None
 
 from trader_dost_arun.core.config import Settings, load_settings
 from trader_dost_arun.core.models import LiquidationEvent, MarketSnapshot, Trade
@@ -42,10 +49,35 @@ def _percentile(values: list[float], percentile: float) -> float:
 
 def _current_rss_mb() -> float:
     try:
-        with open('/proc/self/status', 'r', encoding='utf-8') as handle:
-            for line in handle:
-                if line.startswith('VmRSS:'):
-                    return round(float(line.split()[1]) / 1024.0, 2)
+        if sys.platform.startswith("linux"):
+            with open("/proc/self/status", "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("VmRSS:"):
+                        return round(float(line.split()[1]) / 1024.0, 2)
+        if sys.platform == "win32":
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("cb", ctypes.c_ulong),
+                    ("PageFaultCount", ctypes.c_ulong),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            counters = PROCESS_MEMORY_COUNTERS()
+            counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+            if ctypes.windll.psapi.GetProcessMemoryInfo(ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+                return round(float(counters.WorkingSetSize) / (1024.0 * 1024.0), 2)
+        if resource is not None:
+            usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            if usage > 0:
+                divisor = 1024.0 if sys.platform != "darwin" else 1024.0 * 1024.0
+                return round(float(usage) / divisor, 2)
     except Exception:  # noqa: BLE001
         return 0.0
     return 0.0
@@ -185,6 +217,7 @@ class TradingApplication:
         system_cfg.setdefault("signal_evaluation_interval_seconds", 1.0)
         system_cfg.setdefault("signal_evaluation_concurrency", 4)
         system_cfg.setdefault("market_queue_maxsize", 5000)
+        system_cfg.setdefault("market_queue_snapshot_capacity_ratio", 0.7)
         ops_cfg = self.settings.config.setdefault("ops", {})
         ops_cfg.setdefault("health_refresh_seconds", 1.0)
         ops_cfg.setdefault("suppression_log_cooldown_seconds", 60)
@@ -259,7 +292,7 @@ class TradingApplication:
             return
         snapshot = self.runtime_snapshot()
         LOGGER.info(
-            "event=runtime_summary window_sec=%s rss_mb=%.2f queue_depth=%s queue_hwm=%s socket_count=%s task_count=%s reconnects=%s caches=%s",
+            "event=runtime_summary window_sec=%s rss_mb=%.2f queue_depth=%s queue_hwm=%s socket_count=%s task_count=%s reconnects=%s queue_overload=%s caches=%s",
             int(runtime_window),
             snapshot["rss_mb"],
             snapshot["queue_depth"],
@@ -267,6 +300,7 @@ class TradingApplication:
             snapshot["socket_count"],
             snapshot["task_count"],
             snapshot["reconnect_count_by_venue"],
+            snapshot["queue_overload"],
             snapshot["cache_sizes"],
         )
         self._runtime_summary_last = now
@@ -452,6 +486,7 @@ class TradingApplication:
                 logging_queue = get_logging_queue_snapshot()
                 state_sizes = self._state_sizes()
                 cache_sizes = self._cache_sizes()
+                queue_overload = self.queue.snapshot() if self.queue is not None and hasattr(self.queue, "snapshot") else {}
                 if network_status["state"] == "degraded":
                     overall_status = "degraded"
                 self.http_server.status = {
@@ -471,6 +506,7 @@ class TradingApplication:
                     "logging": logging_queue,
                     "cache_sizes": cache_sizes,
                     "state_sizes": state_sizes,
+                    "queue_overload": queue_overload,
                     "topology": self._topology(),
                 }
                 self.stats.peak_task_count = max(self.stats.peak_task_count, len(asyncio.all_tasks()))
@@ -497,6 +533,7 @@ class TradingApplication:
         logging_queue = get_logging_queue_snapshot()
         state_sizes = self._state_sizes()
         cache_sizes = self._cache_sizes()
+        queue_overload = self.queue.snapshot() if self.queue is not None and hasattr(self.queue, "snapshot") else {}
         rss_mb = _current_rss_mb()
         return {
             "runtime_duration_seconds": duration,
@@ -529,6 +566,7 @@ class TradingApplication:
             "logging": logging_queue,
             "state_sizes": state_sizes,
             "cache_sizes": cache_sizes,
+            "queue_overload": queue_overload,
             "rss_mb": rss_mb,
             "rss_peak_mb": max(self.stats.rss_mb_samples, default=rss_mb),
             "health": self.http_server.status,
