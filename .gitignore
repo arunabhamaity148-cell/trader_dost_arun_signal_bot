@@ -33,7 +33,6 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Local secrets/runtime
 .env
 .env.*
 !.env.example

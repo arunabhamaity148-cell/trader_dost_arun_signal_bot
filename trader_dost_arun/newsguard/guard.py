@@ -52,6 +52,14 @@ class NewsGuard:
         self._task: asyncio.Task | None = None
         self._own_client = external_client is None
         self._merge_semaphore = asyncio.Semaphore(max(1, int(self.config.get("semantic_max_concurrency", 1))))
+        # Single lock guarding ALL reads and writes of self.events. Previously only
+        # _merge_event_async took this lock; observe_market()/assess()/refresh_once()
+        # iterated self.events without it, which raced against concurrent mutation
+        # from the news-refresh loop and raised:
+        #   RuntimeError: dictionary changed size during iteration
+        # Every symbol/venue signal-evaluation task calls assess() concurrently
+        # (see app.py's per-key asyncio.create_task scheduling), so this lock is on
+        # the hot path and must stay cheap - it only guards dict access, not I/O.
         self._event_merge_lock = asyncio.Lock()
         self._event_retention_hours = float(self.config.get("event_retention_hours", 24.0))
         self.sources = self._build_sources()
@@ -79,6 +87,11 @@ class NewsGuard:
 
     async def start(self) -> None:
         if self._task is None:
+            # Pre-load the embedding model here, before websocket connectors are
+            # started (see app.py startup order) and before the refresh loop
+            # begins merging news events. This avoids the model's one-time load
+            # cost landing in the same window as the initial market-data burst.
+            await self.embedder.warmup()
             self._task = asyncio.create_task(self._refresh_loop(), name="news-guard-refresh")
             await self.refresh_once()
 
@@ -185,10 +198,12 @@ class NewsGuard:
                     LOGGER.warning("news source %s item normalization failed: %s", getattr(source, "name", "unknown"), type(exc).__name__)
                     continue
                 await self._merge_event_async(event)
-        for event in self.events.values():
-            self._advance_lifecycle(event)
-        self._prune_expired_events()
-        for event in self.events.values():
+        async with self._event_merge_lock:
+            for event in self.events.values():
+                self._advance_lifecycle(event)
+            self._prune_expired_events()
+            events_snapshot = list(self.events.values())
+        for event in events_snapshot:
             self.store.upsert_event(event)
 
     def _merge_event(self, incoming: NewsEvent) -> None:
@@ -257,9 +272,15 @@ class NewsGuard:
                 return True
         return False
 
-    def observe_market(self, symbol: str, state: MarketStateStore) -> None:
+    async def observe_market(self, symbol: str, state: MarketStateStore) -> None:
         now = datetime.now(timezone.utc)
-        for event in self.events.values():
+        # Take a stable snapshot of the events under the lock so this can no longer
+        # race against _merge_event_async() mutating self.events concurrently
+        # (previously caused: RuntimeError: dictionary changed size during iteration).
+        async with self._event_merge_lock:
+            events_snapshot = list(self.events.values())
+        updated_events: list[NewsEvent] = []
+        for event in events_snapshot:
             if not self._symbol_matches(event, symbol):
                 continue
             if event.lifecycle not in {"peak", "resolved", "decay"}:
@@ -289,13 +310,16 @@ class NewsGuard:
                 funding_change_bps=(post_funding - pre_funding) * 10_000,
                 measured_at=now,
             )
+            updated_events.append(event)
+        for event in updated_events:
             self.store.upsert_event(event)
 
-    def assess(self, symbol: str, venue: str, features: FeatureSet, state: MarketStateStore, external: ExternalContext, regime: str) -> ImpactAssessment:
+    async def assess(self, symbol: str, venue: str, features: FeatureSet, state: MarketStateStore, external: ExternalContext, regime: str) -> ImpactAssessment:
         del venue, features, external, regime
-        self.observe_market(symbol, state)
+        await self.observe_market(symbol, state)
         assessment = ImpactAssessment()
-        relevant = [event for event in self.events.values() if event.lifecycle != "expired" and self._symbol_matches(event, symbol)]
+        async with self._event_merge_lock:
+            relevant = [event for event in self.events.values() if event.lifecycle != "expired" and self._symbol_matches(event, symbol)]
         if not relevant:
             return assessment
         confidence_multiplier = 1.0

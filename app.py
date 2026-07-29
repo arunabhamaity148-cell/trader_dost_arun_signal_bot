@@ -69,9 +69,29 @@ def _current_rss_mb() -> float:
                     ("PeakPagefileUsage", ctypes.c_size_t),
                 ]
 
+            # GetCurrentProcess returns a HANDLE (pointer-sized: 8 bytes on 64-bit
+            # Windows) as the pseudo-handle -1. Without explicit argtypes/restype,
+            # ctypes assumes the default c_int (4 bytes) return type, truncating
+            # that handle. GetProcessMemoryInfo's first arg is then read with the
+            # wrong width too, so the call silently fails (or returns 0) on every
+            # 64-bit Windows run and the except clause below swallowed it,
+            # producing rss_mb=0.00 in every runtime_summary log line. Declaring
+            # the correct ctypes signatures fixes this.
+            kernel32 = ctypes.windll.kernel32
+            psapi = ctypes.windll.psapi
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            kernel32.GetCurrentProcess.argtypes = []
+            psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+            psapi.GetProcessMemoryInfo.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
+                ctypes.c_ulong,
+            ]
+
             counters = PROCESS_MEMORY_COUNTERS()
             counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
-            if ctypes.windll.psapi.GetProcessMemoryInfo(ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+            handle = kernel32.GetCurrentProcess()
+            if psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
                 return round(float(counters.WorkingSetSize) / (1024.0 * 1024.0), 2)
         if resource is not None:
             usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -229,10 +249,16 @@ class TradingApplication:
     async def start(self) -> None:
         if self.queue is not None:
             return
+        # news_guard.start() pre-warms the sentence-transformer embedding model
+        # (a one-time blocking-ish load) before manager.start() opens the
+        # exchange websockets. Previously the model loaded lazily on first use,
+        # which landed in the same window as the initial snapshot flood from
+        # the just-opened connections and contributed to the large one-time
+        # burst of dropped/coalesced snapshots seen at startup.
+        await self.news_guard.start()
         self.queue = await self.manager.start()
         await self.http_server.start()
         await self.external_client.start()
-        await self.news_guard.start()
         await self.bot.start()
         await self._evaluation_scheduler.start()
         self._log_telegram_status()

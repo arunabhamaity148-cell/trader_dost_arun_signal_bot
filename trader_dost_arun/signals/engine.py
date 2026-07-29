@@ -127,7 +127,7 @@ class SignalEngine:
         await detector.observe(features.get("realized_vol_5m"), features.get("trade_delta"), features.get("funding_rate"))
         regime_record = detector.current()
         structural = build_structural_state(state.view(venue, symbol), features.get("delta_oi"))
-        news_assessment = self.news_guard.assess(symbol, venue, features, state, external, regime_record.label) if self.news_guard else None
+        news_assessment = await self.news_guard.assess(symbol, venue, features, state, external, regime_record.label) if self.news_guard else None
         candidates = self.strategies.evaluate_all(venue, symbol, features, structural, state, peer_features, regime_record.label)
         accepted: list[Signal] = []
         for signal in candidates:

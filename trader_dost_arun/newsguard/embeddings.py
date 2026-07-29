@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import OrderedDict
 from functools import lru_cache
 from threading import RLock
@@ -24,6 +25,22 @@ class SemanticTextEmbedder:
     @lru_cache(maxsize=1)
     def _model(self):
         return SentenceTransformer("all-MiniLM-L6-v2") if SentenceTransformer is not None else None
+
+    async def warmup(self) -> None:
+        """Load the sentence-transformer model in a worker thread ahead of time.
+
+        Without this, the model is lazily constructed on the first call to
+        similarity(), which happens the first time two news items need
+        deduplicating. In production that first call landed in the same
+        startup window as the initial websocket snapshot flood (see the
+        `sentence_transformers.SentenceTransformer Load pretrained ...` log
+        line appearing seconds after connect), competing for CPU with the
+        event loop right when the ingress queue is under the most pressure
+        and contributing to the large one-time burst of dropped/coalesced
+        snapshots. Calling this once during NewsGuard.start(), before any
+        connectors are live, moves that one-time cost out of the hot path.
+        """
+        await asyncio.to_thread(self._model)
 
     def cache_size(self) -> int:
         with self._lock:
