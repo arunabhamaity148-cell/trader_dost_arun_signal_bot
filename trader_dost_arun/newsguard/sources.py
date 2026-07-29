@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -151,11 +152,28 @@ class RSSNewsSource(BaseNewsSource):
     async def fetch(self) -> list[RawNewsItem]:
         if self.should_skip():
             return []
-        try:
-            response = await self.client.get(self.url, follow_redirects=True)
-            response.raise_for_status()
-        except Exception as exc:  # noqa: BLE001
-            self._record_failure(f"rss fetch error: {type(exc).__name__}")
+        # Retry transient network failures (timeout/connect/DNS) a couple of
+        # times before recording a failure and entering the source's cooldown.
+        # Previously a single transient glitch (e.g. gaierror, ConnectTimeout)
+        # immediately triggered up to a 15-minute cooldown for that source,
+        # even though the same URL fetched fine moments later - these are
+        # public RSS endpoints with no auth, so the fix is retrying the
+        # request, not credentials.
+        max_attempts = 3
+        response = None
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = await self.client.get(self.url, follow_redirects=True)
+                response.raise_for_status()
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt < max_attempts:
+                    await asyncio.sleep(0.5 * attempt)
+        if last_exc is not None or response is None:
+            self._record_failure(f"rss fetch error: {type(last_exc).__name__}")
             return []
         content_type = response.headers.get("content-type", "").lower()
         text = response.text.strip()

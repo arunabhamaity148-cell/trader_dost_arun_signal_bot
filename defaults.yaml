@@ -19,6 +19,18 @@ connectors:
     stable_connection_reset_seconds: 20
     recv_timeout_seconds: 30
     max_symbols_per_connection: 5
+    # REST resilience: raised from the 10s/3-attempt defaults after production
+    # logs showed frequent ConnectTimeout/ConnectError/gaierror on public
+    # open-interest polling under normal (non-blocked) network conditions.
+    # None of these calls use an API key - they are all public endpoints -
+    # so the fix is longer timeouts/more retries, not credentials.
+    http_timeout_seconds: 20.0
+    http_max_attempts: 5
+    http_max_connections: 6
+    http_max_keepalive_connections: 3
+    http_max_concurrency: 3
+    http_retry_base_delay_seconds: 1.0
+    http_retry_max_delay_seconds: 20.0
   bybit:
     reconnect_base_delay_seconds: 1.0
     reconnect_max_delay_seconds: 30.0
@@ -26,6 +38,13 @@ connectors:
     stable_connection_reset_seconds: 20
     recv_timeout_seconds: 30
     max_symbols_per_connection: 5
+    http_timeout_seconds: 20.0
+    http_max_attempts: 5
+    http_max_connections: 6
+    http_max_keepalive_connections: 3
+    http_max_concurrency: 3
+    http_retry_base_delay_seconds: 1.0
+    http_retry_max_delay_seconds: 20.0
   okx:
     open_interest_poll_seconds: 15
     reconnect_base_delay_seconds: 1.0
@@ -34,6 +53,13 @@ connectors:
     stable_connection_reset_seconds: 20
     recv_timeout_seconds: 30
     max_symbols_per_connection: 5
+    http_timeout_seconds: 20.0
+    http_max_attempts: 5
+    http_max_connections: 6
+    http_max_keepalive_connections: 3
+    http_max_concurrency: 3
+    http_retry_base_delay_seconds: 1.0
+    http_retry_max_delay_seconds: 20.0
   hyperliquid:
     open_interest_poll_seconds: 15
     reconnect_base_delay_seconds: 1.0
@@ -42,6 +68,13 @@ connectors:
     stable_connection_reset_seconds: 20
     recv_timeout_seconds: 30
     max_symbols_per_connection: 5
+    http_timeout_seconds: 20.0
+    http_max_attempts: 5
+    http_max_connections: 6
+    http_max_keepalive_connections: 3
+    http_max_concurrency: 3
+    http_retry_base_delay_seconds: 1.0
+    http_retry_max_delay_seconds: 20.0
   deribit:
     options_poll_seconds: 30
     reconnect_base_delay_seconds: 1.0
@@ -50,6 +83,13 @@ connectors:
     stable_connection_reset_seconds: 20
     recv_timeout_seconds: 30
     max_symbols_per_connection: 20
+    http_timeout_seconds: 20.0
+    http_max_attempts: 5
+    http_max_connections: 6
+    http_max_keepalive_connections: 3
+    http_max_concurrency: 3
+    http_retry_base_delay_seconds: 1.0
+    http_retry_max_delay_seconds: 20.0
 external:
   refresh_seconds: 180
 ops:
