@@ -1,5 +1,0 @@
-binance
-bybit
-deribit
-hyperliquid
-okx

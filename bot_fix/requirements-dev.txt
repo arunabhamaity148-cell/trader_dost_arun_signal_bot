@@ -1,5 +1,0 @@
-# Development, testing and reporting dependencies.
-# These are NOT needed to run the bot in production.
-pytest==8.3.3
-plotly==5.24.0
-shap==0.46.0
