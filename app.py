@@ -18,6 +18,7 @@ except Exception:  # noqa: BLE001
 
 from trader_dost_arun.core.config import Settings, load_settings
 from trader_dost_arun.core.models import LiquidationEvent, MarketSnapshot, Trade
+from trader_dost_arun.core.operator_state import OperatorState
 from trader_dost_arun.core.persistence import PositionStore
 from trader_dost_arun.core.state import MarketStateStore
 from trader_dost_arun.data.external import ExternalDataClient
@@ -120,6 +121,7 @@ class RuntimeStats:
     evaluation_latency_ms: deque[float] = field(default_factory=lambda: deque(maxlen=5000))
     event_loop_lag_ms: deque[float] = field(default_factory=lambda: deque(maxlen=5000))
     rss_mb_samples: deque[float] = field(default_factory=lambda: deque(maxlen=1440))
+    signal_alerts_failed: int = 0
 
 
 class SignalEvaluationScheduler:
@@ -210,13 +212,27 @@ class TradingApplication:
             news_cfg["whale_monitor"]["api_key"] = os.getenv("ETHERSCAN_API_KEY", "")
         self.news_guard = NewsGuard(self.settings.config, self.external_client.client)
         self.position_store = PositionStore(self.settings.config.get("positions", {}).get("db_path", "./data/positions.sqlite3"))
-        self.signal_engine = SignalEngine(self.settings.config, news_guard=self.news_guard, position_store=self.position_store)
+        # ONE shared operator-toggles object. The signal engine reads pause/resume
+        # from it; the admin bot writes to it. This closes the wiring gap that made
+        # /pause and /resume silently no-ops.
+        self.operator_state = OperatorState(self.settings.config.get("ops", {}).get("bot_state_path", "./data/bot_state.json"))
+        self.signal_engine = SignalEngine(self.settings.config, news_guard=self.news_guard, position_store=self.position_store, operator_state=self.operator_state)
+        # Rebuild live win-rate/payoff-ratio per strategy from real closed-trade
+        # history instead of leaving every strategy at the neutral prior
+        # (win_rate=0.5, payoff_ratio=1.0) until enough fresh trades close
+        # after this restart. See MarketStateStore.rebuild_performance_from_history.
+        self.state.rebuild_performance_from_history(self.position_store.get_closed_realized_r_by_strategy())
         self.manager = ConnectorManager(self.settings.config, self.latency)
-        self.http_server = OpsHttpServer(port=int(self.settings.config.get("ops", {}).get("health_port", 8080)))
+        # Bind the ops/health server to a private interface only by default - exposing
+        # the full internal state (/health, /metrics) on 0.0.0.0 is a disclosure risk.
+        ops_bind = self.settings.config.get("ops", {}).get("bind_host", "127.0.0.1")
+        self.http_server = OpsHttpServer(port=int(self.settings.config.get("ops", {}).get("health_port", 8080)), host=ops_bind)
         self.bot = TelegramAdminBot(
             self.settings.telegram_token,
             os.getenv("TELEGRAM_ADMIN_CHAT_ID", self.settings.config.get("telegram", {}).get("admin_chat_id", "")),
             position_store=self.position_store,
+            operator_state=self.operator_state,
+            engine_stats_provider=self.signal_engine.engine_stats,
         )
         self.queue: asyncio.Queue | None = None
         self._stop = asyncio.Event()
@@ -318,7 +334,7 @@ class TradingApplication:
             return
         snapshot = self.runtime_snapshot()
         LOGGER.info(
-            "event=runtime_summary window_sec=%s rss_mb=%.2f queue_depth=%s queue_hwm=%s socket_count=%s task_count=%s reconnects=%s queue_overload=%s caches=%s",
+            "event=runtime_summary window_sec=%s rss_mb=%.2f queue_depth=%s queue_hwm=%s socket_count=%s task_count=%s reconnects=%s queue_overload=%s caches=%s alerts_failed=%s telegram_consecutive_failures=%s",
             int(runtime_window),
             snapshot["rss_mb"],
             snapshot["queue_depth"],
@@ -328,11 +344,38 @@ class TradingApplication:
             snapshot["reconnect_count_by_venue"],
             snapshot["queue_overload"],
             snapshot["cache_sizes"],
+            snapshot["signal_alerts_failed"],
+            snapshot["telegram_consecutive_send_failures"],
         )
         self._runtime_summary_last = now
 
+    def install_signal_handlers(self) -> None:
+        """Register SIGINT/SIGTERM so the process shuts down gracefully on a
+        VPS stop signal (systemd/docker send SIGTERM). Without this, SIGTERM was
+        not handled and Python would terminate immediately mid-write. On Windows,
+        add_signal_handler only supports SIGINT; SIGTERM falls back to the
+        default, which is caught by the KeyboardInterrupt handler in __main__.
+        """
+        loop = asyncio.get_running_loop()
+        for sig_name in ("SIGINT", "SIGTERM"):
+            sig = getattr(__import__("signal"), sig_name, None)
+            if sig is None:
+                continue
+            try:
+                loop.add_signal_handler(sig, self.request_shutdown, sig_name)
+            except (NotImplementedError, RuntimeError, ValueError):
+                # Windows event loops don't support add_signal_handler except SIGINT
+                # via Ctrl+C; that's already covered by the KeyboardInterrupt guard.
+                pass
+
+    def request_shutdown(self, sig_name: str = "unknown") -> None:
+        LOGGER.info("shutdown signal received (%s); stopping gracefully", sig_name)
+        if not self._stopping:
+            self._stop.set()
+
     async def run_forever(self) -> None:
         await self.start()
+        self.install_signal_handlers()
         try:
             await self._stop.wait()
         except asyncio.CancelledError:
@@ -353,6 +396,13 @@ class TradingApplication:
             self._background_tasks.clear()
             await self.bot.stop()
             await self.http_server.stop()
+            # Close the pooled Telegram client if the alerter exposes aclose().
+            alerter_close = getattr(self.alerts, "aclose", None)
+            if callable(alerter_close):
+                try:
+                    await alerter_close()
+                except Exception:  # noqa: BLE001 - shutdown must never crash
+                    LOGGER.exception("telegram alerter close failed")
             await self.news_guard.close()
             await self.external_client.close()
             await self.manager.stop()
@@ -439,7 +489,27 @@ class TradingApplication:
                     SIGNAL_COUNTER.inc()
                 self.stats.signals_emitted += 1
                 LOGGER.info("signal fired %s %s %s", signal.symbol, signal.strategy_name, signal.direction.value)
-                await self.alerts.signal_alert(signal)
+                delivery_result = await self.alerts.signal_alert(signal)
+                if delivery_result == "failed":
+                    self.stats.signal_alerts_failed += 1
+                    # Loud on purpose: a real-money trade signal that failed
+                    # to reach Telegram must never look identical to a
+                    # successfully delivered one in the logs. ERROR (not
+                    # WARNING) so it stands out, and it escalates further
+                    # below if delivery keeps failing (e.g. an expired
+                    # token), since that means EVERY signal from here on is
+                    # silently not reaching the user.
+                    LOGGER.error(
+                        "ALERT DELIVERY FAILED for signal %s %s %s - consecutive_failures=%s last_error=%s",
+                        signal.symbol, signal.strategy_name, signal.direction.value,
+                        self.alerts.consecutive_send_failures, self.alerts.last_send_error,
+                    )
+                    if self.alerts.consecutive_send_failures >= 3:
+                        LOGGER.critical(
+                            "TELEGRAM ALERTS HAVE FAILED %s TIMES IN A ROW - signals are being generated but "
+                            "NOT reaching you. Check the bot token/chat id and network connectivity.",
+                            self.alerts.consecutive_send_failures,
+                        )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -461,7 +531,25 @@ class TradingApplication:
 
     def _build_feature_inputs(self, view: Any, peers: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
         feature_map = compute_features(view, peers)
-        peer_features = {peer_venue: compute_features(peer_view, peers) for peer_venue, peer_view in peers.items() if peer_view.snapshots}
+        # Peer features only need the fields the VetoEngine/strategies actually
+        # read (premium, dispersion) and cross-venue freshness. Recomputing the
+        # entire feature surface for every peer was the single largest hot-path
+        # cost; we now only materialize what is required.
+        def _minimal(view_own: Any) -> Any:
+            if view_own is None or not getattr(view_own, "snapshots", None):
+                return None
+            latest = view_own.snapshots[-1]
+            from trader_dost_arun.core.models import FeatureSet
+            from datetime import datetime, timezone
+            values = {
+                "premium": float(latest.premium) if latest.premium is not None else 0.0,
+                "delta_oi": abs(float(latest.open_interest) - (float(view_own.snapshots[-2].open_interest) if len(view_own.snapshots) > 1 and view_own.snapshots[-2].open_interest else float(latest.open_interest))) if latest.open_interest is not None else 0.0,
+            }
+            return FeatureSet(venue=latest.venue, symbol=latest.symbol, timestamp=latest.arrival_time, values=values)
+        peer_features: dict[str, Any] = {}
+        for pv, pw in peers.items():
+            if pw.snapshots:
+                peer_features[pv] = _minimal(pw)
         return feature_map, peer_features
 
     async def _event_loop_monitor(self) -> None:
@@ -583,6 +671,9 @@ class TradingApplication:
             "healthy_snapshot_evaluations": self.stats.healthy_snapshot_evaluations,
             "signals_evaluated": self.stats.signals_evaluated,
             "signals_emitted": self.stats.signals_emitted,
+            "signal_alerts_failed": self.stats.signal_alerts_failed,
+            "telegram_consecutive_send_failures": self.alerts.consecutive_send_failures,
+            "telegram_last_send_error": self.alerts.last_send_error,
             "evaluation_latency_p95_ms": _percentile(evaluation_latency_samples, 0.95),
             "evaluation_latency_max_ms": max(evaluation_latency_samples, default=0.0),
             "event_loop_lag_p95_ms": _percentile(event_loop_lag_samples, 0.95),
@@ -609,4 +700,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        pass
+        # Fallback when SIGINT isn't delivered via add_signal_handler (Windows
+        # event loops). The graceful stop in run_forever() handles the work.
+        print("Interrupted; shutting down.", flush=True)

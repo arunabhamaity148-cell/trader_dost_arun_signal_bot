@@ -67,11 +67,14 @@ class NoopService:
 
 
 class NoopAlerts:
+    consecutive_send_failures = 0
+    last_send_error = None
+
     async def health_alert(self, *_args, **_kwargs):
         return None
 
     async def signal_alert(self, *_args, **_kwargs):
-        return None
+        return "sent"
 
 
 class FakeManager:

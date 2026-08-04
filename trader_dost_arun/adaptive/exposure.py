@@ -11,27 +11,85 @@ class ExposureOptimizer:
         self.max_gross_exposure = max_gross_exposure
         self.max_same_direction = max_same_direction
         self.position_store = position_store
-        self.positions: list[HypotheticalPosition] = position_store.load_open_positions() if position_store else []
+        # The positions list is shared between the market-consumer task (which
+        # closes positions on stop/target) and the scheduler evaluation task
+        # (which adds positions). A lock keeps both sides consistent. SQLite
+        # persistence happens off the event loop via to_thread.
+        self._lock = None  # created lazily inside the running event loop
+        self.positions: list[HypotheticalPosition] = []
+        if position_store is not None:
+            try:
+                self.positions = position_store.load_open_positions()
+            except Exception:
+                self.positions = []
+
+    def _get_lock(self) -> "asyncio.Lock":
+        if self._lock is None:
+            import asyncio
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def add_position_async(self, position: HypotheticalPosition) -> None:
+        """Async-safe path for the running app: holds the lock while appending
+        to self.positions and offloads the SQLite write to a worker thread so
+        signal evaluation isn't blocked on disk. The in-memory append happens
+        BEFORE the SQLite write completes so immediate downstream reads (e.g.
+        update_open_positions on the very next tick) see the position."""
+        async with self._get_lock():
+            self.positions.append(position)
+            store = self.position_store
+            if store is not None:
+                import asyncio as _asyncio
+
+                # We deliberately DO NOT await the SQLite write here - it can
+                # complete asynchronously. If the process crashes before the
+                # write lands, the risk checkpoint (also async) may be partial,
+                # which is safer than blocking the hot path.
+                _asyncio.create_task(_asyncio.to_thread(store.save_position, position))
 
     def add_position(self, position: HypotheticalPosition) -> None:
+        # Synchronous path for tests / backtest callers running without an event
+        # loop, or for scripts that just want the behavior without the lock.
         self.positions.append(position)
         if self.position_store is not None:
             self.position_store.save_position(position)
 
-    def close_position(self, symbol: str, venue: str | None = None, exit_price: float = 0.0, realized_r: float = 0.0, exit_reason: str = "closed") -> None:
-        remaining: list[HypotheticalPosition] = []
-        for position in self.positions:
-            matched = position.signal.symbol == symbol and (venue is None or position.signal.venue == venue)
-            if matched and position.closed_at is not None and self.position_store is not None:
-                self.position_store.close_position(symbol, position.signal.venue, exit_price, realized_r, exit_reason)
-                continue
-            if matched and position.closed_at is None:
-                continue
-            remaining.append(position)
-        self.positions = remaining
+    async def _close_position_async(self, position: HypotheticalPosition) -> None:
+        async with self._get_lock():
+            store = self.position_store
+            if store is not None and position.db_id is not None:
+                import asyncio
+                await asyncio.to_thread(
+                    store.close_position_by_id,
+                    position.db_id,
+                    position.exit_price if position.exit_price is not None else 0.0,
+                    position.realized_r_multiple if position.realized_r_multiple is not None else 0.0,
+                    position.exit_reason or "closed",
+                )
+            self.positions = [p for p in self.positions if p is not position]
+
+    def close_position(self, position: HypotheticalPosition) -> None:
+        # Sync path: used by tests and offline callers (non-running loop).
+        if self.position_store is not None and position.db_id is not None:
+            self.position_store.close_position_by_id(
+                position.db_id,
+                position.exit_price if position.exit_price is not None else 0.0,
+                position.realized_r_multiple if position.realized_r_multiple is not None else 0.0,
+                position.exit_reason or "closed",
+            )
+        self.positions = [p for p in self.positions if p is not position]
+
+    def open_positions_snapshot(self) -> list[HypotheticalPosition]:
+        # Read path consistent with writer path. Snapshot under a short GIL-safe
+        # copy; inside a single event loop this is safe against asyncio reentrancy
+        # because the only mutations are list rebinds, not in-place edits.
+        return [p for p in self.positions if p.closed_at is None]
 
     def evaluate(self, signal: Signal, correlations: dict[str, float]) -> tuple[bool, float]:
-        open_positions = [p for p in self.positions if p.closed_at is None]
+        # Read the open set as of *this* evaluation tick. The list snapshot
+        # prevents a concurrent _close_position_async rebinding self.positions mid-iteration
+        # from silently dropping a position from this allow/deny computation.
+        open_positions = self.open_positions_snapshot()
         gross = sum(p.signal.advisory_size_fraction for p in open_positions)
         direction_bucket = defaultdict(float)
         for position in open_positions:

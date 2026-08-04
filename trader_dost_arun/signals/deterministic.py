@@ -11,6 +11,14 @@ class DeterministicStrategyEngine:
         self.config = config
         self.priors = config["strategy_priors"]
 
+    def _strat_cfg(self, name: str) -> dict:
+        """Fetch per-strategy config, tolerating a missing section (treated as
+        empty dict). Previously strategies read config["strategies"][name]
+        directly and raised KeyError if a strategy was omitted from
+        config/strategies (e.g. after editing the YAML), killing the entire
+        evaluation pass for that symbol."""
+        return self.config.get("strategies", {}).get(name, {})
+
     def evaluate_all(self, venue: str, symbol: str, features: FeatureSet, structural: StructuralState, state: MarketStateStore, peer_features: dict[str, FeatureSet], regime: str) -> list[Signal]:
         strategies = [
             self.liquidation_cascade_continuation,
@@ -73,7 +81,7 @@ class DeterministicStrategyEngine:
 
     def aggressor_exhaustion_absorption_fade(self, venue, symbol, f, s, state, peers, regime):
         muted_progress = abs((f.get("mid_price") - f.get("rolling_vwap"))) < 0.5 * max(f.get("atr"), 1e-9)
-        if abs(f.get("cvd")) < self.config["strategies"]["aggressor_exhaustion_absorption_fade"]["cvd_extreme"] or not muted_progress or f.get("delta_oi") < 0:
+        if abs(f.get("cvd")) < self._strat_cfg("aggressor_exhaustion_absorption_fade").get("cvd_extreme", 1000) or not muted_progress or f.get("delta_oi") < 0:
             return None
         direction = Direction.LONG if s.bullish_sweep or s.bullish_order_block_active else Direction.SHORT if s.bearish_sweep or s.bearish_order_block_active else Direction.FLAT
         if direction == Direction.FLAT:
@@ -84,7 +92,7 @@ class DeterministicStrategyEngine:
         return self._build_signal("aggressor_exhaustion_absorption_fade", venue, symbol, direction, entry, stop, [t for t in targets if t], ["CVD extreme", "absorption shelf", "microprice divergence", "OI not flushing"], regime)
 
     def fresh_oi_breakout_continuation(self, venue, symbol, f, s, state, peers, regime):
-        if f.get("delta_oi") <= self.config["strategies"]["fresh_oi_breakout_continuation"]["delta_oi_min"] or abs(f.get("premium_zscore")) >= self.config["strategies"]["fresh_oi_breakout_continuation"]["premium_z_max"]:
+        if f.get("delta_oi") <= self._strat_cfg("fresh_oi_breakout_continuation").get("delta_oi_min", 10000) or abs(f.get("premium_zscore")) >= self._strat_cfg("fresh_oi_breakout_continuation").get("premium_z_max", 2.0):
             return None
         recent = state.view(venue, symbol).closes[-20:]
         if len(recent) < 10:
@@ -104,7 +112,7 @@ class DeterministicStrategyEngine:
         return self._build_signal("fresh_oi_breakout_continuation", venue, symbol, direction, price, stop, [target], ["range break", "fresh OI", "premium widening", "no absorption"], regime)
 
     def single_venue_premium_snapback(self, venue, symbol, f, s, state, peers, regime):
-        if abs(f.get("premium_zscore")) < 2 or abs(f.get("delta_oi")) > self.config["strategies"]["single_venue_premium_snapback"]["delta_oi_abs_max"]:
+        if abs(f.get("premium_zscore")) < 2 or abs(f.get("delta_oi")) > self._strat_cfg("single_venue_premium_snapback").get("delta_oi_abs_max", 10000):
             return None
         direction = Direction.SHORT if f.get("premium") > 0 else Direction.LONG
         entry = f.get("mark_price")
@@ -115,7 +123,7 @@ class DeterministicStrategyEngine:
 
     def cross_venue_basis_dispersion_convergence(self, venue, symbol, f, s, state, peers, regime):
         peer_premia = [p.get("premium") for p in peers.values() if p.get("premium")]
-        if len(peer_premia) < 2 or abs(f.get("premium") - mean(peer_premia)) < self.config["strategies"]["cross_venue_basis_dispersion_convergence"]["premium_gap_min"]:
+        if len(peer_premia) < 2 or abs(f.get("premium") - mean(peer_premia)) < self._strat_cfg("cross_venue_basis_dispersion_convergence").get("premium_gap_min", 5):
             return None
         direction = Direction.SHORT if f.get("premium") > mean(peer_premia) else Direction.LONG
         entry = f.get("mark_price") or f.get("mid_price")
@@ -125,7 +133,7 @@ class DeterministicStrategyEngine:
 
     def spot_index_lead_follow_through(self, venue, symbol, f, s, state, peers, regime):
         gap = f.get("index_price") - f.get("mark_price")
-        if abs(gap) < self.config["strategies"]["spot_index_lead_follow_through"]["lag_gap_min"] or abs(f.get("premium_zscore")) > 1.5:
+        if abs(gap) < self._strat_cfg("spot_index_lead_follow_through").get("lag_gap_min", 4) or abs(f.get("premium_zscore")) > 1.5:
             return None
         direction = Direction.LONG if gap > 0 and f.get("order_book_imbalance") > 0 else Direction.SHORT if gap < 0 and f.get("order_book_imbalance") < 0 else Direction.FLAT
         if direction == Direction.FLAT:
@@ -136,7 +144,7 @@ class DeterministicStrategyEngine:
         return self._build_signal("spot_index_lead_follow_through", venue, symbol, direction, entry, stop, [target], ["spot/index impulse", "perp lag", "premium neutral", "OFI aligned"], regime)
 
     def funding_window_inventory_rebalance(self, venue, symbol, f, s, state, peers, regime):
-        if abs(f.get("funding_rate")) < self.config["strategies"]["funding_window_inventory_rebalance"]["funding_abs_min"] or f.get("open_interest") <= self.config["strategies"]["funding_window_inventory_rebalance"]["open_interest_min"]:
+        if abs(f.get("funding_rate")) < self._strat_cfg("funding_window_inventory_rebalance").get("funding_abs_min", 0.0001) or f.get("open_interest") <= self._strat_cfg("funding_window_inventory_rebalance").get("open_interest_min", 1):
             return None
         direction = Direction.LONG if f.get("trade_delta") > 0 and f.get("order_book_imbalance") > 0 else Direction.SHORT if f.get("trade_delta") < 0 and f.get("order_book_imbalance") < 0 else Direction.FLAT
         if direction == Direction.FLAT:
@@ -151,7 +159,7 @@ class DeterministicStrategyEngine:
             return None
         atm_iv = abs(f.get("option_atm_iv"))
         skew = abs(f.get("option_put_call_skew"))
-        if atm_iv < self.config["strategies"]["deribit_iv_shock_repricing"]["iv_proxy_min"] and skew < self.config["strategies"]["deribit_iv_shock_repricing"].get("skew_abs_min", 0.05):
+        if atm_iv < self._strat_cfg("deribit_iv_shock_repricing").get("iv_proxy_min", 1.8) and skew < self._strat_cfg("deribit_iv_shock_repricing").get("skew_abs_min", 0.05):
             return None
         direction = Direction.LONG if f.get("premium") > 0 and f.get("delta_oi") >= 0 else Direction.SHORT if f.get("premium") < 0 and f.get("delta_oi") <= 0 else Direction.FLAT
         if direction == Direction.FLAT:

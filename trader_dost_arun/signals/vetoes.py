@@ -14,6 +14,7 @@ class VetoEngine:
 
     def evaluate(self, strategy_name: str, venue: str, symbol: str, features: FeatureSet, structural: StructuralState, state: MarketStateStore, external: ExternalContext, peer_features: dict[str, FeatureSet], minutes_to_funding: float | None = None, news_assessment: ImpactAssessment | None = None) -> tuple[dict[str, bool], str | None]:
         checks = {
+            "data_completeness": self._data_completeness(strategy_name, features),
             "stale_snapshot": self._stale_snapshot(venue, symbol, features, state),
             "spread_depth_deterioration": self._spread_depth_veto(venue, symbol, features, state),
             "wrong_leverage_regime": self._wrong_leverage_regime(strategy_name, features),
@@ -29,6 +30,32 @@ class VetoEngine:
         }
         failed = [name for name, allowed in checks.items() if not allowed]
         return checks, failed[0] if failed else None
+
+    def _data_completeness(self, strategy_name: str, features: FeatureSet) -> bool:
+        """Refuse to trust a signal built on inputs that were never fetched.
+
+        features.get(...) silently returns 0.0 for anything missing (e.g. an
+        open-interest REST call that timed out), and several checks below -
+        _wrong_leverage_regime's reversion-strategy branch in particular -
+        treat "delta_oi <= 0" as a real bearish reading. A failed fetch and a
+        genuinely flat market look identical to that check unless we
+        distinguish them here first. This runs before every other veto so a
+        strategy never gets evaluated on data it doesn't actually have.
+        """
+        continuation = {"liquidation_cascade_continuation", "order_flow_imbalance_continuation", "fresh_oi_breakout_continuation", "spot_index_lead_follow_through", "funding_window_inventory_rebalance", "deribit_iv_shock_repricing"}
+        reversion = {"extreme_funding_crowding_reversion", "aggressor_exhaustion_absorption_fade", "single_venue_premium_snapback", "cross_venue_basis_dispersion_convergence"}
+        required: set[str] = set()
+        if strategy_name in continuation or strategy_name in reversion:
+            required.add("delta_oi")
+        if strategy_name in reversion:
+            required.add("funding_zscore")
+            required.add("premium_zscore")
+        if strategy_name == "funding_window_inventory_rebalance":
+            required.add("funding_rate")
+        # exchange_instability's mark/index gap check runs for every strategy
+        required.add("mark_price")
+        required.add("index_price")
+        return not features.any_missing(*required)
 
     def _stale_snapshot(self, venue: str, symbol: str, features: FeatureSet, state: MarketStateStore) -> bool:
         max_age_seconds = float(self.config["vetoes"]["exchange_instability"].get("max_feed_lag_seconds", 2))

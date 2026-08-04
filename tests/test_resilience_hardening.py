@@ -66,11 +66,14 @@ class NoopService:
 
 
 class RaisingAlerts:
+    consecutive_send_failures = 0
+    last_send_error = None
+
     async def health_alert(self, *_args, **_kwargs):
         raise RuntimeError("alert transport down")
 
     async def signal_alert(self, *_args, **_kwargs):
-        return None
+        return "sent"
 
 
 class ClosingClient:

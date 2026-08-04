@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime, timezone
 
 from trader_dost_arun.adaptive.bayesian import BayesianConfidenceModel
 from trader_dost_arun.adaptive.exposure import ExposureOptimizer
@@ -37,8 +38,13 @@ class SignalEngine:
         "cross_venue_basis_dispersion_convergence",
     }
 
-    def __init__(self, config: dict, news_guard: NewsGuard | None = None, position_store: PositionStore | None = None):
+    def __init__(self, config: dict, news_guard: NewsGuard | None = None, position_store: PositionStore | None = None, operator_state=None):
         self.config = config
+        # Shared operator-toggles object. When app.py constructs us it passes
+        # the same OperatorState the TelegramAdminBot writes to, so /pause and
+        # /resume reach the live signal path. Falls back to a console-default
+        # instance for tests so nothing here requires wiring.
+        self._operator_state = operator_state
         self.vetoes = VetoEngine(config)
         self.strategies = DeterministicStrategyEngine(config)
         self.risk = RiskEngine(config)
@@ -59,6 +65,11 @@ class SignalEngine:
         self.news_guard = news_guard
         self.slippage = SlippageModel(config.get("execution", {}).get("slippage_mode", "realistic"))
         self.checkpoint = StateCheckpoint(config.get("checkpoint", {}).get("path", "./data/checkpoint.json"))
+        # Rehydrate risk-engine state (kill switch, daily loss, consecutive
+        # losses) from the last checkpoint written before this process
+        # started/restarted. See RiskEngine.restore_state for why this
+        # matters: without it, a restart silently wipes the safety brake.
+        self.risk.restore_state(self.checkpoint.load_latest().get("risk", {}))
 
     async def update_open_positions(self, venue: str, symbol: str, state: MarketStateStore) -> list[HypotheticalPosition]:
         latest = state.view(venue, symbol).latest
@@ -87,17 +98,33 @@ class SignalEngine:
             feature_map = position.signal.metadata.get("feature_map")
             if feature_map:
                 self.importance.update(feature_map, int(position.outcome or 0))
-            self.exposure.close_position(position.signal.symbol, position.signal.venue, exit_price=exit_price, realized_r=position.realized_r_multiple or 0.0, exit_reason=position.exit_reason or "closed")
+            await self.exposure._close_position_async(position)
             closed.append(position)
-        self._save_checkpoint()
+        if closed:
+            self._save_checkpoint()
         return closed
 
     def _save_checkpoint(self) -> None:
         self.checkpoint.save(
             {
-                "risk": {"daily_realized_r": self.risk.daily_realized_r, "daily_slippage_cost": self.risk.daily_slippage_cost},
+                "day": datetime.now(timezone.utc).date().isoformat(),
+                "risk": {
+                    "daily_realized_r": self.risk.daily_realized_r,
+                    "daily_slippage_cost": self.risk.daily_slippage_cost,
+                    "consecutive_losses": self.risk.consecutive_losses,
+                    "kill_switch_active": self.risk.kill_switch_active,
+                },
                 "positions": len([p for p in self.exposure.positions if p.closed_at is None]),
             }
+        )
+
+    def _has_open_position(self, strategy_name: str, symbol: str, venue: str) -> bool:
+        return any(
+            p.closed_at is None
+            and p.signal.strategy_name == strategy_name
+            and p.signal.symbol == symbol
+            and p.signal.venue == venue
+            for p in self.exposure.positions
         )
 
     def _regime_weight(self, strategy_name: str, regime: str) -> tuple[str, float, float]:
@@ -129,10 +156,18 @@ class SignalEngine:
         structural = build_structural_state(state.view(venue, symbol), features.get("delta_oi"))
         news_assessment = await self.news_guard.assess(symbol, venue, features, state, external, regime_record.label) if self.news_guard else None
         candidates = self.strategies.evaluate_all(venue, symbol, features, structural, state, peer_features, regime_record.label)
+        # Snapshot the shared pause set once per evaluation. This is the LIVE
+        # read of /pause (previously this read getattr(news_guard,
+        # "paused_strategies"), which was always [] because NewsGuard never
+        # owned that state - the admin bot's writes lived on a different object).
+        operator = self._operator_state
+        paused_strategies = operator.paused_strategies() if (operator is not None and hasattr(operator, "paused_strategies")) else getattr(self.news_guard, "paused_strategies", [])
+        paused_set = set(paused_strategies)
         accepted: list[Signal] = []
         for signal in candidates:
-            if signal.strategy_name in getattr(self.news_guard, "paused_strategies", []):
+            if signal.strategy_name in paused_set:
                 signal.suppressed_reason = "strategy_paused"
+                state.suppression_counts["strategy_paused"] += 1
                 continue
             weight_label, confidence_mult, priority_mult = self._regime_weight(signal.strategy_name, regime_record.label)
             if priority_mult < 0.55:
@@ -147,6 +182,19 @@ class SignalEngine:
                 continue
             if structural.contradicts(signal.direction):
                 signal.suppressed_reason = "structural_contradiction"
+                state.suppression_counts[signal.suppressed_reason] += 1
+                continue
+            if self._has_open_position(signal.strategy_name, signal.symbol, signal.venue):
+                # Without this, the exact same strategy could re-fire on the
+                # exact same symbol+venue on the very next evaluation tick
+                # (every signal_evaluation_interval_seconds) while a position
+                # it already opened is still live - exposure.evaluate() only
+                # caps aggregate portfolio size/direction, it never checks
+                # for this specific duplicate. That meant the same setup
+                # could alert repeatedly while you were already in the
+                # trade, encouraging a repeat entry into a position you
+                # already hold.
+                signal.suppressed_reason = "duplicate_open_position"
                 state.suppression_counts[signal.suppressed_reason] += 1
                 continue
             perf = state.performances[signal.strategy_name]
@@ -172,6 +220,14 @@ class SignalEngine:
             signal.metadata["live_win_rate"] = perf.win_rate * 100
             signal.metadata["live_samples"] = perf.sample_size
             signal = self.risk.refine_signal(signal, features.get("atr"), self.config["strategies"].get(signal.strategy_name, {}))
+            # Fail-closed: reject any degenerate signal (entry<=0, stop==entry,
+            # stop on the wrong side, no upside target) BEFORE sizing so a bad
+            # strategy output can never produce a garbage R or an unsafe alert.
+            valid, invalid_reason = self.risk.is_valid_signal(signal)
+            if not valid:
+                signal.suppressed_reason = f"invalid_signal:{invalid_reason}"
+                state.suppression_counts["invalid_signal"] += 1
+                continue
             fill_price, slippage_bps = self.slippage.expected_fill_price(signal.entry, signal.direction, features.get("spread"), max(signal.advisory_size_fraction, 0.01), features.get("same_side_depth"))
             effective_reward = abs((signal.targets[0] if signal.targets else signal.entry) - fill_price)
             effective_risk = abs(fill_price - signal.stop)
@@ -194,8 +250,30 @@ class SignalEngine:
                 continue
             signal.advisory_size_fraction = scaled_size / max(risk_mult, 1.0)
             signal.metadata["priority_score"] = signal.confidence * priority_mult
-            position = HypotheticalPosition(signal=signal, leverage=float(signal.metadata.get("leverage", 1.0)), fill_price=fill_price)
-            self.exposure.add_position(position)
+            # Compute the model-side leverage once and mirror it into metadata so
+            # the advisory template and the internal HypotheticalPosition can no
+            # longer disagree. Fixes "Display shows 5x while the model uses 1.0x".
+            from trader_dost_arun.ops.alerts import advisory_leverage
+            model_leverage = float(advisory_leverage(signal))
+            signal.metadata["leverage"] = model_leverage
+            position = HypotheticalPosition(signal=signal, leverage=model_leverage, fill_price=fill_price)
+            # Persist off the event loop so this SQLite write never stalls signal
+            # production on a slow disk.
+            await self.exposure.add_position_async(position)
             accepted.append(signal)
-        self._save_checkpoint()
+        if accepted:
+            # Persist risk/kill-switch state once per evaluation that produced
+            # a position (not per candidate). The checkpoint write is cheap but
+            # synchronous; keep it out of the per-signal hot loop.
+            self._save_checkpoint()
         return sorted(accepted, key=lambda item: item.metadata.get("priority_score", item.confidence), reverse=True)
+
+    def engine_stats(self) -> dict:
+        """Small read-only snapshot for the admin bot's /status command."""
+        return {
+            "kill_switch_active": self.risk.kill_switch_active,
+            "daily_realized_r": round(self.risk.daily_realized_r, 3),
+            "consecutive_losses": self.risk.consecutive_losses,
+            "open_positions": len([p for p in self.exposure.positions if p.closed_at is None]),
+            "paused_strategies": self._operator_state.paused_strategies() if self._operator_state else [],
+        }

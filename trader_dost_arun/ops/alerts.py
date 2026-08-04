@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import sqlite3
@@ -12,6 +13,17 @@ from trader_dost_arun.core.models import Direction, Signal, VenueHealth
 from trader_dost_arun.ops.logging_utils import CooldownDeduper
 
 LOGGER = logging.getLogger(__name__)
+
+
+def advisory_leverage(signal: Signal) -> int:
+    """Shared leverage heuristic used both to SIZE the internal hypothetical
+    position and to DISPLAY leverage in the alert template. Before this helper
+    existed, the two sides computed leverage from different code paths (engine
+    used metadata.get("leverage", 1.0) == 1.0 while the template showed up to
+    5x), so the R math in your position tracker never matched the advertised
+    leverage in the message."""
+    stop_pct = max(signal.stop_pct, 1e-6)
+    return min(5, max(1, ceil(1 / (stop_pct * 10))))
 
 
 class SignalCounterStore:
@@ -35,21 +47,60 @@ class TelegramAlerter:
         self.counter = SignalCounterStore(counter_db)
         self._health_deduper = CooldownDeduper(default_cooldown_seconds=60.0)
         self._disabled_log_deduper = CooldownDeduper(default_cooldown_seconds=300.0)
+        # Delivery-failure tracking: previously a failed send() only logged a
+        # warning and returned - a signal could silently never reach the
+        # user with no visible difference from a successful delivery. These
+        # let app.py detect delivery failures (including consecutive
+        # failures, e.g. an expired token) and surface them loudly instead
+        # of only in a log file nobody is watching.
+        self.consecutive_send_failures = 0
+        self.last_send_error: str | None = None
+        self.total_signal_alerts_sent = 0
+        self.total_signal_alerts_failed = 0
+        # Second line of defense against duplicate alerts, independent of
+        # engine.py's duplicate_open_position gate: keyed on strategy+symbol
+        # +venue+direction so the same setup can't spam a Telegram alert
+        # repeatedly within the cooldown window even if some future code
+        # path generates it twice (e.g. a manual re-evaluation or a bug in
+        # the exposure check upstream).
+        self._signal_deduper = CooldownDeduper(default_cooldown_seconds=90.0)
 
-    async def send(self, text: str, parse_mode: str = "HTML") -> None:
+    async def send(self, text: str, parse_mode: str = "HTML") -> bool:
+        """Send a Telegram message. Returns True on confirmed delivery,
+        False otherwise (including when Telegram is unconfigured). Retries
+        transient failures a few times before giving up.
+
+        Uses a single long-lived httpx.AsyncClient instead of creating a new
+        client per send (which previously added TLS handshake + connection-pool
+        setup overhead to EVERY alert under load)."""
         if not self.token or not self.chat_id:
             if self._disabled_log_deduper.should_emit("telegram-disabled"):
                 LOGGER.info("Telegram DISABLED - missing token or chat id")
-            return
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
+            return False
+        client = await self._get_client()
+        max_attempts = 3
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
                 response = await client.post(
                     f"https://api.telegram.org/bot{self.token}/sendMessage",
                     json={"chat_id": self.chat_id, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True},
                 )
                 response.raise_for_status()
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("telegram send failed: %s", exc)
+                self.consecutive_send_failures = 0
+                self.last_send_error = None
+                return True
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt < max_attempts:
+                    await asyncio.sleep(1.0 * attempt)
+        self.consecutive_send_failures += 1
+        self.last_send_error = f"{type(last_exc).__name__}: {last_exc}"
+        LOGGER.warning(
+            "telegram send failed after %s attempts (consecutive_failures=%s): %s",
+            max_attempts, self.consecutive_send_failures, last_exc,
+        )
+        return False
 
     def _bar(self, value: float) -> str:
         filled = max(0, min(10, round(value / 10)))
@@ -62,9 +113,23 @@ class TelegramAlerter:
             return "🟡"
         return "🔴"
 
+    async def _get_client(self) -> httpx.AsyncClient:
+        client = getattr(self, "_client", None)
+        if client is None:
+            # Lazily create once; the single client multiplexes via HTTP/2 to
+            # api.telegram.org.
+            client = httpx.AsyncClient(timeout=10)
+            self._client = client
+        return client
+
+    async def aclose(self) -> None:
+        client = getattr(self, "_client", None)
+        if client is not None:
+            await client.aclose()
+            self._client = None
+
     def _leverage(self, signal: Signal) -> int:
-        stop_pct = max(signal.stop_pct, 1e-6)
-        return min(5, max(1, ceil(1 / (stop_pct * 10))))
+        return advisory_leverage(signal)
 
     def render_signal(self, signal: Signal) -> str:
         counter = self.counter.next()
@@ -154,8 +219,21 @@ class TelegramAlerter:
         ]
         return "\n".join(lines)
 
-    async def signal_alert(self, signal: Signal) -> None:
-        await self.send(self.render_signal(signal), parse_mode="HTML")
+    async def signal_alert(self, signal: Signal) -> str:
+        """Returns 'sent', 'duplicate' (suppressed by cooldown dedup - not a
+        failure), or 'failed' (genuine delivery failure). Callers must not
+        treat 'duplicate' as a failure - see app.py's alert-failure escalation,
+        which only fires on 'failed'."""
+        key = f"signal:{signal.strategy_name}:{signal.symbol}:{signal.venue}:{signal.direction.value}"
+        if not self._signal_deduper.should_emit(key):
+            LOGGER.info("signal alert suppressed as duplicate within cooldown: %s", key)
+            return "duplicate"
+        delivered = await self.send(self.render_signal(signal), parse_mode="HTML")
+        if delivered:
+            self.total_signal_alerts_sent += 1
+            return "sent"
+        self.total_signal_alerts_failed += 1
+        return "failed"
 
     async def health_alert(self, health: VenueHealth) -> None:
         key = f"health:{health.venue}:{health.status}:{round(health.score, 0)}"

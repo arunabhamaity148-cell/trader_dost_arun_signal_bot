@@ -95,10 +95,26 @@ class FeatureSet:
     symbol: str
     timestamp: datetime
     values: dict[str, float | int | bool | str] = field(default_factory=dict)
+    # Names of features that could not be computed/fetched for this snapshot
+    # (e.g. REST enrichment timed out for open interest or funding rate).
+    # get() silently defaulted these to 0.0, which vetoes/strategies then
+    # treated as a real market reading of exactly zero - e.g. delta_oi=0.0
+    # from a failed fetch looks identical to a genuinely flat delta_oi=0.0,
+    # and some veto checks (like reversion strategies' "delta_oi <= 0")
+    # would silently pass on missing data instead of the real market state.
+    missing: frozenset[str] = field(default_factory=frozenset)
 
     def get(self, name: str, default: float = 0.0) -> float:
         value = self.values.get(name, default)
         return float(value) if isinstance(value, (int, float, bool)) else default
+
+    def is_missing(self, name: str) -> bool:
+        """True if this feature was never computed (as opposed to computed
+        and genuinely equal to zero/default)."""
+        return name in self.missing
+
+    def any_missing(self, *names: str) -> bool:
+        return any(name in self.missing for name in names)
 
 
 @dataclass(slots=True)
@@ -166,6 +182,12 @@ class HypotheticalPosition:
     fill_price: float | None = None
     funding_cost: float = 0.0
     exit_reason: str | None = None
+    # Row id from PositionStore.save_position(), used to close exactly this
+    # position instead of matching by symbol+venue. Without this, two
+    # concurrently open positions on the same symbol+venue (e.g. from two
+    # different strategies, which nothing prevents) could have one's close
+    # silently overwrite the other's exit_price/realized_r in SQLite.
+    db_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -234,6 +256,21 @@ class MarketStateView:
     open_interests: list[float]
     funding_rates: list[float]
     premiums: list[float]
+    # Optional pre-aggregated series produced by MarketStateStore (see
+    # KeyedSeries). compute_features() uses these O(1) values instead of
+    # rescanning the full snapshot/trade history for every evaluation. They
+    # are in the same mathematical meaning as the fields above; constructing
+    # an empty MarketStateView without them is still valid for tests that build
+    # views directly without a store.
+    trade_delta200: float | None = None
+    cvd_total: float | None = None
+    vwap_price_volume_120: float | None = None
+    vwap_volume_120: float | None = None
+    vwap_price_volume_total: float | None = None
+    vwap_volume_total: float | None = None
+    ofi_series: list[float] | None = None
+    option_atm_iv_series: list[float] | None = None
+    option_put_call_skew_series: list[float] | None = None
 
     @property
     def latest(self) -> MarketSnapshot | None:

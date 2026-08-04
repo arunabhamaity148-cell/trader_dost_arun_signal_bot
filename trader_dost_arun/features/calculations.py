@@ -30,15 +30,21 @@ def _safe_float(value: float | int | None, default: float = 0.0, *, positive_onl
     return numeric
 
 
-def _zscore(values: list[float], current: float) -> float:
+def _zscore(values: list[float], current: float, window: int | None = None) -> float:
     current_value = _safe_float(current)
     series = _finite_values(values)
+    if window is not None and len(series) > window:
+        series = series[-window:]
     if len(series) < 3:
         return 0.0
-    sigma = pstdev(series)
-    if sigma == 0:
+    # numpy std is ~10-50x faster than statistics.pstdev for >=1000 samples and
+    # avoids the exact rational arithmetic that made _zscore the dominant
+    # cost on large history windows.
+    arr = np.asarray(series, dtype=float)
+    sigma = float(np.std(arr))
+    if sigma == 0.0:
         return 0.0
-    return (current_value - mean(series)) / sigma
+    return float((current_value - float(arr.mean())) / sigma)
 
 
 def order_book_imbalance(snapshot: MarketSnapshot, levels: int = 10) -> float:
@@ -97,17 +103,22 @@ def volume_profile(view: MarketStateView, bins: int = 20) -> dict[str, float]:
 
 
 def atr(view: MarketStateView, window: int = 14) -> float:
-    closes = _finite_values(view.closes, positive_only=True)
-    highs = _finite_values(view.highs, positive_only=True)
-    lows = _finite_values(view.lows, positive_only=True)
+    # Operate only on the tail needed to fill the ATR window. Iterating the
+    # full closes/highs/lows series scaled with history length and was the
+    # dominant cost (~7ms per call on 3000 samples). The result is unchanged:
+    # ATR only reads the last (window+1) triplets regardless of total history.
+    max_needed = min(window + 2, len(view.closes), len(view.highs), len(view.lows))
+    if max_needed < 2:
+        return 0.0
+    closes = _finite_values(list(view.closes)[-max_needed:], positive_only=True)
+    highs = _finite_values(list(view.highs)[-max_needed:], positive_only=True)
+    lows = _finite_values(list(view.lows)[-max_needed:], positive_only=True)
     if len(closes) < 2:
         return 0.0
     trs: list[float] = []
-    for i in range(1, min(len(closes), len(highs), len(lows))):
-        high = highs[i]
-        low = lows[i]
-        prev_close = closes[i - 1]
-        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    n = min(len(closes), len(highs), len(lows))
+    for i in range(1, n):
+        trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
     sample = _finite_values(trs[-window:] if len(trs) >= window else trs)
     return mean(sample) if sample else 0.0
 
@@ -140,18 +151,43 @@ def compute_features(view: MarketStateView, peer_views: dict[str, MarketStateVie
     latest = view.latest
     if latest is None:
         raise ValueError("Cannot compute features without at least one market snapshot")
+    missing: set[str] = set()
     ofi = order_book_imbalance(latest, 10)
-    delta = trade_delta(view.trades)
-    rvwap = rolling_vwap(view, 120)
-    session_vwap = rolling_vwap(view, len(view.trades)) if view.trades else 0.0
+    # Use the store-maintained running aggregates when available so the hot path
+    # never rescans the full snapshot/trade history (O(history) -> O(1)).
+    delta = view.trade_delta200 if view.trade_delta200 is not None else trade_delta(view.trades)
+    if view.vwap_price_volume_120 is not None and view.vwap_volume_120 and view.vwap_volume_120 > 0:
+        rvwap = view.vwap_price_volume_120 / view.vwap_volume_120
+    else:
+        rvwap = rolling_vwap(view, 120)
+    if view.vwap_price_volume_total is not None and view.vwap_volume_total and view.vwap_volume_total > 0:
+        session_vwap = view.vwap_price_volume_total / view.vwap_volume_total
+    else:
+        session_vwap = rolling_vwap(view, len(view.trades)) if view.trades else 0.0
     profile = volume_profile(view)
+    if not view.open_interests:
+        # REST enrichment (e.g. /fapi/v1/openInterest) has never successfully
+        # returned data for this symbol - current_oi/delta_oi below are
+        # placeholders, not a real "no change" reading of zero.
+        missing.add("open_interest")
+        missing.add("delta_oi")
     current_oi = _safe_float(view.open_interests[-1] if view.open_interests else 0.0)
     previous_oi = _safe_float(view.open_interests[-2] if len(view.open_interests) > 1 else current_oi)
     delta_oi = current_oi - previous_oi
+    if not view.funding_rates:
+        missing.add("funding_rate")
+        missing.add("funding_zscore")
     funding = _safe_float(view.funding_rates[-1] if view.funding_rates else 0.0)
     funding_z = _zscore(view.funding_rates[:-1], funding) if len(view.funding_rates) > 3 else 0.0
     latest_mark = _safe_float(latest.mark_price, positive_only=True)
     latest_index = _safe_float(latest.index_price, positive_only=True)
+    if latest_mark <= 0.0:
+        missing.add("mark_price")
+    if latest_index <= 0.0:
+        missing.add("index_price")
+    if not view.premiums:
+        missing.add("premium")
+        missing.add("premium_zscore")
     premium = _safe_float(view.premiums[-1] if view.premiums else (latest_mark - latest_index))
     premium_z = _zscore(view.premiums[:-1], premium) if len(view.premiums) > 3 else 0.0
     liquidation_notional = sum(_safe_float(item.notional, default=0.0) for item in view.liquidations[-50:])
@@ -170,13 +206,15 @@ def compute_features(view: MarketStateView, peer_views: dict[str, MarketStateVie
     spread = _safe_float(latest.spread, default=0.0)
     if spread == 0.0 and latest.ask_levels and latest.bid_levels:
         spread = _safe_float(latest.ask_levels[0].price) - _safe_float(latest.bid_levels[0].price)
-    option_iv_series = [float(snap.option_atm_iv) for snap in view.snapshots if _is_finite(snap.option_atm_iv)]
-    option_skew_series = [float(snap.option_put_call_skew) for snap in view.snapshots if _is_finite(snap.option_put_call_skew)]
+    option_iv_series = view.option_atm_iv_series if view.option_atm_iv_series is not None else [float(snap.option_atm_iv) for snap in view.snapshots if _is_finite(snap.option_atm_iv)]
+    option_skew_series = view.option_put_call_skew_series if view.option_put_call_skew_series is not None else [float(snap.option_put_call_skew) for snap in view.snapshots if _is_finite(snap.option_put_call_skew)]
+    cvd_value = view.cvd_total if view.cvd_total is not None else trade_delta(view.trades, len(view.trades))
+    ofi_history = view.ofi_series if view.ofi_series is not None else [order_book_imbalance(s, 10) for s in view.snapshots[:-1] if s.bid_levels and s.ask_levels]
     values = {
         "order_book_imbalance": ofi,
-        "ofi_zscore": _zscore([order_book_imbalance(s, 10) for s in view.snapshots[:-1] if s.bid_levels and s.ask_levels][-250:], ofi),
+        "ofi_zscore": _zscore(ofi_history[-250:], ofi),
         "trade_delta": delta,
-        "cvd": trade_delta(view.trades, len(view.trades)),
+        "cvd": cvd_value,
         "rolling_vwap": rvwap,
         "session_vwap": session_vwap,
         "poc": profile["poc"],
@@ -211,4 +249,4 @@ def compute_features(view: MarketStateView, peer_views: dict[str, MarketStateVie
         "option_iv_zscore": _zscore(option_iv_series[:-1], _safe_float(latest.option_atm_iv, default=0.0)) if len(option_iv_series) > 3 else 0.0,
         "option_skew_zscore": _zscore(option_skew_series[:-1], _safe_float(latest.option_put_call_skew, default=0.0)) if len(option_skew_series) > 3 else 0.0,
     }
-    return FeatureSet(venue=latest.venue, symbol=latest.symbol, timestamp=latest.arrival_time, values=sanitize_feature_values(values))
+    return FeatureSet(venue=latest.venue, symbol=latest.symbol, timestamp=latest.arrival_time, values=sanitize_feature_values(values), missing=frozenset(missing))

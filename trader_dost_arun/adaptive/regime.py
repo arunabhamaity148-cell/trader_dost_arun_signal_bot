@@ -43,6 +43,12 @@ class HMMRegimeDetector:
         self.state_labels: dict[int, str] = {}
         self.last_fit_started_at = 0.0
         self._fit_task: asyncio.Task | None = None
+        # Guard: even within a single event loop, two consecutive await points in
+        # observe() can both see the same done _fit_task. Without this lock, the
+        # second coroutine hits `await task` on an already-cancelled task and
+        # the `assert` in _consume_fit_task fires. The lock makes consumption
+        # idempotent across concurrent observers of the same symbol.
+        self._fit_lock = asyncio.Lock()
         self._current_label = "warmup"
         self._current_state = -1
         self._current_probabilities = [1.0]
@@ -90,9 +96,11 @@ class HMMRegimeDetector:
         self._current_label = label
 
     async def _consume_fit_task(self) -> None:
-        assert self._fit_task is not None
-        task = self._fit_task
-        self._fit_task = None
+        async with self._fit_lock:
+            task = self._fit_task
+            if task is None:
+                return
+            self._fit_task = None
         try:
             result = await task
         except Exception as exc:  # noqa: BLE001
@@ -112,6 +120,20 @@ class HMMRegimeDetector:
         except Exception as exc:  # noqa: BLE001
             self._last_fit_error = str(exc)
             LOGGER.warning("hmm background fit failed: %s", exc)
+
+    async def close(self) -> None:
+        """Cancel any in-flight refit so the background to_thread future is not
+        left to run past process exit (the CPython runtime prints "Task was
+        destroyed but it is pending!" when the event loop dies with a scheduled
+        future still attached)."""
+        task = self._fit_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        self._fit_task = None
 
     def _set_warmup(self, state: int = -1, probs: list[float] | None = None) -> None:
         self._current_label = "warmup"

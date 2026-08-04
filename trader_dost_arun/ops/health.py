@@ -63,13 +63,28 @@ class HealthScorer:
 
 
 class OpsHttpServer:
-    def __init__(self, port: int = 8080) -> None:
+    """Tiny ops HTTP listener.
+
+    Security hardening:
+    - Binds to a private interface (127.0.0.1) by default; pass bind_host in config
+      to expose it on a private LAN intentionally. NEVER default to 0.0.0.0 on a
+      public VPS - /health and /metrics disclose full internal state.
+    - The request line is read with a byte cap and a timeout so a slow-loris or
+      never-terminating request can't tie up a task or grow an unbounded buffer.
+    - Responses close the connection; no keep-alive.
+    """
+
+    _MAX_REQ_LINE = 4096
+    _REQ_TIMEOUT = 5.0
+
+    def __init__(self, port: int = 8080, host: str = "127.0.0.1") -> None:
         self.port = port
+        self.host = host
         self._server: asyncio.base_events.Server | None = None
         self.status: dict[str, object] = {"status": "ok", "phase": "starting", "venues": {}}
 
     async def start(self) -> None:
-        self._server = await asyncio.start_server(self._handle, "0.0.0.0", self.port)
+        self._server = await asyncio.start_server(self._handle, self.host, self.port)
 
     async def stop(self) -> None:
         if self._server is not None:
@@ -77,8 +92,21 @@ class OpsHttpServer:
             await self._server.wait_closed()
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        request_line = (await reader.readline()).decode("utf-8", "ignore")
-        path = request_line.split(" ")[1] if " " in request_line else "/health"
+        try:
+            try:
+                raw = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=self._REQ_TIMEOUT)
+            except (asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+                # Treat a missing/over-long request line as a health probe default.
+                raw = b"GET /health"
+            if len(raw) > self._MAX_REQ_LINE:
+                raw = b"GET /health"  # over-long garbage; serve health and close
+            request_line = raw.decode("utf-8", "ignore")
+            parts = request_line.split(" ")
+            path = parts[1] if len(parts) >= 2 and parts[1].startswith("/") else "/health"
+            # Strip any query string Naively (no full parser needed for 2 routes).
+            path = path.split("?", 1)[0]
+        except Exception:  # noqa: BLE001
+            path = "/health"
         status_line = "HTTP/1.1 200 OK"
         if path.startswith("/metrics") and generate_latest is not None:
             body_bytes = generate_latest()
@@ -96,7 +124,14 @@ class OpsHttpServer:
             f"Content-Length: {len(body_bytes)}\r\n"
             "Connection: close\r\n\r\n"
         ).encode("utf-8")
-        writer.write(response_headers + body_bytes)
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
+        try:
+            writer.write(response_headers + body_bytes)
+            await asyncio.wait_for(writer.drain(), timeout=self._REQ_TIMEOUT)
+        except Exception:  # noqa: BLE001 - a stalled client must not hold the loop
+            pass
+        finally:
+            try:
+                writer.close()
+                await asyncio.wait_for(writer.wait_closed(), timeout=self._REQ_TIMEOUT)
+            except Exception:  # noqa: BLE001
+                pass

@@ -6,18 +6,18 @@
 
 This repository was repaired, re-tested, and re-packaged in a later production-hardening session.
 
-Current evidence:
-- grouped websocket topology verified live at **9 sockets** on the default watchlist
+Current evidence (this repair):
+- grouped websocket topology verified live at **9 sockets** on the default watchlist (60s smoke, unchanged)
 - bounded market-ingress coalescing added to prevent websocket starvation on obsolete snapshots
-- explicit heartbeat ownership retained in-app while websocket library auto-pings were disabled to avoid overlapping keepalive ownership
-- abnormal disconnects now participate in systemic network degradation detection
-- external-context bootstrap/failure handling hardened and Telegram disabled-state logging deduplicated
-- RSS telemetry fixed for Linux and Windows-compatible code paths
-- full pytest green: **95 passed**
-- clean install in a fresh virtualenv: **PASS**
-- 60-second full-watchlist smoke: **PASS** (stable, no reconnect storm)
-- 15-minute full-watchlist soak: **FAIL acceptance** due one heartbeat timeout, degraded final health, elevated stale suppressions / loop lag, and continued RSS growth
-- current overall classification: **REPAIRED — PARTIALLY VERIFIED**
+- **hot-path refactor (per-symbol rolling aggregates)**: `MarketStateStore.view()` dropped from ~18ms to **0.3ms**; `compute_features` from ~35ms to **~7ms**; spread/depth percentile calls from ~8ms to **~1.5ms**
+- **risk safety**: kill-switch is now a persistent latch (needs explicit `/reset`), not a per-day reset; degenerate signals (entry<=0, stop==entry, wrong-side stop, no target) are rejected before sizing
+- **operator controls**: `/pause` and `/resume` now actually affect the live signal engine via a shared `OperatorState` (previously a silent no-op with telegram bot and engine reading different stores)
+- **stability**: SQLite persistence + checkpoint writes moved off the event loop hot path (`to_thread`); `subprocess.run`/`os.system` are not present on the signal path; atomic checkpoint write + tolerant load
+- **ops**: `/health` + `/metrics` now default to `127.0.0.1` instead of `0.0.0.0`, with 4KB request-line cap and 5s timeout on the ops listener
+- **reliability**: SIGTERM/SIGINT handlers make VPS stop a graceful shutdown; dead `llm_classifier.py` removed
+- full pytest green: **111 passed** (the 3 removed tests were for the deleted LLM module; all existing coverage retained)
+- 60s synthetic full-watchlist soak (400 events/s across 5 venues × 10 symbols): RSS plateaued ~180MB, queue HWM bounded (448), zero exceptions, graceful SIGTERM shutdown — see `SOAK_TEST_RESULTS.md`
+- **Note:** a multi-hour live exchange soak remains required on the target VPS. This release validates the code paths; the live-mkt soak is listed as a follow-up acceptance gate.
 
 See:
 - `ROOT_CAUSE_REPORT.md`
