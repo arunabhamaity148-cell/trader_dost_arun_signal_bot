@@ -32,6 +32,15 @@ class SharedHttpResources:
     last_request_monotonic: float = 0.0
     consecutive_failures: int = 0
     circuit_open_until: float = 0.0
+    # Separate from circuit_open_until: a 429 means the exchange is actively
+    # rate-limiting this IP across ALL connections/symbols on this venue,
+    # not just this one request. Previously a 429 was folded into the same
+    # consecutive_failures counter as a plain timeout/DNS error, given the
+    # same short backoff, and logged identically to any other retry - so a
+    # genuine rate-limit condition (which on Binance can escalate to a 418
+    # IP ban if ignored) looked no different from an ordinary network blip.
+    rate_limited_until: float = 0.0
+    consecutive_rate_limits: int = 0
 
 
 class HeartbeatTimeoutError(TimeoutError):
@@ -189,8 +198,9 @@ class BasePublicConnector(abc.ABC):
         min_interval = max(0.0, float(self.config.get("http_min_interval_seconds", 0.0)))
         async with self._http_resources.request_lock:
             now = time.monotonic()
-            if self._http_resources.circuit_open_until > now:
-                await self._sleep_or_stop(self._http_resources.circuit_open_until - now)
+            wait_until = max(self._http_resources.circuit_open_until, self._http_resources.rate_limited_until)
+            if wait_until > now:
+                await self._sleep_or_stop(wait_until - now)
             now = time.monotonic()
             wait = max((self._http_resources.last_request_monotonic + min_interval) - now, 0.0)
             if wait > 0:
@@ -200,6 +210,7 @@ class BasePublicConnector(abc.ABC):
     def _mark_rest_success(self) -> None:
         self._http_resources.consecutive_failures = 0
         self._http_resources.circuit_open_until = 0.0
+        self._http_resources.consecutive_rate_limits = 0
 
     def _mark_rest_failure(self, attempt: int) -> float:
         self._http_resources.consecutive_failures += 1
@@ -216,6 +227,33 @@ class BasePublicConnector(abc.ABC):
         self._http_resources.circuit_open_until = max(self._http_resources.circuit_open_until, time.monotonic() + cooldown)
         return cooldown
 
+    def _mark_rate_limited(self, response: httpx.Response) -> float:
+        """Handle a 429 as a venue-wide rate-limit event, distinct from the
+        generic transient-error circuit breaker. Applies a longer, dedicated
+        cooldown shared across every connector on this venue (all
+        symbol-groups share the same SharedHttpResources instance - see
+        _acquire_shared_http_resources), and honors Retry-After if given.
+        Repeated 429s escalate the cooldown further, since ignoring
+        persistent rate-limiting on venues like Binance can lead to a
+        temporary IP ban (HTTP 418).
+        """
+        self._http_resources.consecutive_rate_limits += 1
+        retry_after = response.headers.get("Retry-After", "").strip()
+        if retry_after.isdigit():
+            base_cooldown = float(retry_after)
+        else:
+            base_cooldown = float(self.config.get("http_rate_limit_base_delay_seconds", 10.0))
+        cooldown = min(
+            base_cooldown * self._http_resources.consecutive_rate_limits,
+            float(self.config.get("http_rate_limit_max_delay_seconds", 120.0)),
+        )
+        self._http_resources.rate_limited_until = max(self._http_resources.rate_limited_until, time.monotonic() + cooldown)
+        self.logger.warning(
+            "rest RATE LIMITED (429) venue=%s symbol=%s consecutive_rate_limits=%s venue_wide_cooldown=%.1fs",
+            self.venue, self.symbol, self._http_resources.consecutive_rate_limits, cooldown,
+        )
+        return cooldown
+
     async def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
         max_attempts = max(1, int(self.config.get("http_max_attempts", 3)))
         url = f"{self.rest_url}{path}"
@@ -229,6 +267,24 @@ class BasePublicConnector(abc.ABC):
                     return response.json()
                 if response.status_code in {401, 403, 404}:
                     response.raise_for_status()
+                if response.status_code == 429:
+                    delay = self._mark_rate_limited(response)
+                    if attempt >= max_attempts:
+                        response.raise_for_status()
+                    await self._sleep_or_stop(delay)
+                    continue
+                if response.status_code == 418:
+                    # Binance-specific: IP has been temporarily banned for
+                    # ignoring rate limits. Retrying quickly makes the ban
+                    # worse, not better - use a much longer floor than a
+                    # plain 429 and always honor Retry-After if present.
+                    delay = self._mark_rate_limited(response)
+                    delay = max(delay, float(self.config.get("http_ip_ban_min_delay_seconds", 60.0)))
+                    self._http_resources.rate_limited_until = max(self._http_resources.rate_limited_until, time.monotonic() + delay)
+                    if attempt >= max_attempts:
+                        response.raise_for_status()
+                    await self._sleep_or_stop(delay)
+                    continue
                 delay = self._retry_after_delay(response, attempt)
                 circuit_delay = self._mark_rest_failure(attempt)
                 delay = max(delay, circuit_delay)
